@@ -509,17 +509,14 @@ static int __init pw_init(void)
 	register_my_kprobes();
 
 	// init timers
-	kt_on = ktime_set(
-		0,
-		on_ms * MS_TO_NS(
-				1)); // ktime_set secs=nsec? better compute below
-	kt_off = ktime_set(0, off_ms * MS_TO_NS(1));
+	kt_on = ms_to_ktime(on_ms);
+	kt_off = ms_to_ktime(off_ms);
 
 	// But MS_TO_NS macro not included? Use multiplies directly:
 	kt_on = ktime_set(0, (s64)on_ms * 1000000LL);
 	kt_off = ktime_set(0, (s64)off_ms * 1000000LL);
 
-	hrtimer_init(&window_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	hrtimer_start(&window_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	window_timer.function = window_timer_cb;
 
 	// Start with ON state by scheduling timer for ON duration to flip to OFF after ON completes.

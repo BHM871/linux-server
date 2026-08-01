@@ -1,4 +1,4 @@
-// page_map_collector.c
+// page_rate_collector.c
 // Kernel module for lightweight observation of page-access sequences.
 //
 // Tested conceptually for x86_64 kernels (target: 6.12.x).
@@ -97,7 +97,7 @@ static atomic64_t total_pairs = ATOMIC64_INIT(0);
 static atomic64_t total_dropped = ATOMIC64_INIT(0);
 
 // proc
-#define PROC_NAME "page_map_pairs"
+#define PROC_NAME "page_rate_pairs"
 static struct proc_dir_entry *proc_entry = NULL;
 
 /* helper: simple 64-bit mix hash for two u64 */
@@ -376,13 +376,13 @@ static int register_my_kprobes(void)
 	int ret;
 	ret = register_kprobe(&kp_mark_page);
 	if (ret < 0) {
-		pr_warn("page_map: failed to register kprobe mark_page_accessed: %d\n",
+		pr_warn("page_rate: failed to register kprobe mark_page_accessed: %d\n",
 			ret);
 		// continue attempt for the other
 	}
 	ret = register_kprobe(&kp_handle_fault);
 	if (ret < 0) {
-		pr_warn("page_map: failed to register kprobe handle_mm_fault: %d\n",
+		pr_warn("page_rate: failed to register kprobe handle_mm_fault: %d\n",
 			ret);
 		// still ok to run with only one probe
 	}
@@ -438,7 +438,7 @@ static int __init pm_init(void)
 	int ret;
 	unsigned int buckets = 1u << pair_hash_bits;
 
-	pr_info("page_map: init (delta_ns=%lu buf_len=%u sample=%u hash_bits=%u)\n",
+	pr_info("page_rate: init (delta_ns=%lu buf_len=%u sample=%u hash_bits=%u)\n",
 		delta_ns, buf_len, sample_rate, pair_hash_bits);
 
 	// sanity checks and limits
@@ -455,14 +455,14 @@ static int __init pm_init(void)
 	// allocate per-cpu buffers
 	ret = alloc_percpu_buffers(buf_len);
 	if (ret) {
-		pr_err("page_map: failed to alloc per-cpu buffers: %d\n", ret);
+		pr_err("page_rate: failed to alloc per-cpu buffers: %d\n", ret);
 		return ret;
 	}
 
 	// create workqueue
-	pm_wq = create_singlethread_workqueue("page_map_wq");
+	pm_wq = create_singlethread_workqueue("page_rate_wq");
 	if (!pm_wq) {
-		pr_err("page_map: failed to create workqueue\n");
+		pr_err("page_rate: failed to create workqueue\n");
 		free_percpu_buffers(buf_len);
 		return -ENOMEM;
 	}
@@ -472,14 +472,14 @@ static int __init pm_init(void)
 	// create proc entry
 	proc_entry = proc_create(PROC_NAME, 0444, NULL, &proc_fops);
 	if (!proc_entry) {
-		pr_warn("page_map: failed to create /proc/%s\n", PROC_NAME);
+		pr_warn("page_rate: failed to create /proc/%s\n", PROC_NAME);
 		// not fatal
 	}
 
 	// register kprobes
 	register_my_kprobes();
 
-	pr_info("page_map: module loaded\n");
+	pr_info("page_rate: module loaded\n");
 	return 0;
 }
 
@@ -513,7 +513,7 @@ static void __exit pm_exit(void)
 		bucket_locks = NULL;
 	}
 
-	pr_info("page_map: module unloaded\n");
+	pr_info("page_rate: module unloaded\n");
 }
 
 module_init(pm_init);
