@@ -3,22 +3,22 @@
 set -e
 
 echo "[+] Atualizando pacotes..."
-sudo apt update -y
+sudo pacman -Su
 
 echo "[+] Instalando stress-ng e utilitários..."
-sudo apt install -y stress-ng htop iotop sysstat curl wget
+sudo pacman -S stress-ng htop iotop sysstat curl wget
 
 echo "[+] Instalando Redis..."
-sudo apt install -y redis-server
+sudo pacman -S redis-server
 
 echo "[+] Instalando Memcached..."
-sudo apt install -y memcached libmemcached-tools
+sudo pacman -S memcached libmemcached-tools
 
 echo "[+] Instalando PostgreSQL..."
-sudo apt install -y postgresql postgresql-contrib
+sudo pacman -S postgresql postgresql-contrib
 
 echo "[+] Instalando Nginx..."
-sudo apt install -y nginx
+sudo pacman -S nginx
 
 echo "[✓] Dependências instaladas com sucesso!"
 
