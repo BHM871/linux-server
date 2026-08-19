@@ -14,9 +14,6 @@ cat $PROCFILE > "$LOGDIR/inicial_proc_dump.txt"
 echo "[...] Rodando stress-ng..."
 ./run_stress_bench.sh
 
-echo "[...] Rodando Redis benchmark..."
-./run_redis_bench.sh
-
 echo "[...] Rodando Memcached benchmark..."
 ./run_memcached_bench.sh
 
