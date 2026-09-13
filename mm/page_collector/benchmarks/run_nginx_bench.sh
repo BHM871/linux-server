@@ -11,8 +11,9 @@ echo "[+] Executando siege (HTTP load test)..."
 
 sudo apt install -y siege
 
-siege -c 50 -t 180s http://localhost \
-    | tee "$LOGDIR/nginx_bench.log"
+siege -c 50 -t 180s http://localhost |
+	tee "$LOGDIR/nginx_bench.log"
+
+sudo systemctl stop nginx
 
 echo "[✓] Nginx benchmark finalizado!"
-

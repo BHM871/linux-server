@@ -1,0 +1,3 @@
+# Virtual segmentation rules
+/benchmarks/setup.sh
+/benchmarks/bench_logs/

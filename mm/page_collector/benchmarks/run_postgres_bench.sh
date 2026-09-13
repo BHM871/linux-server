@@ -11,8 +11,9 @@ echo "[+] Preparando banco pgbench..."
 sudo -u postgres pgbench -i -s 10 postgres
 
 echo "[+] Executando pgbench..."
-sudo -u postgres pgbench -c 10 -t 100000 postgres \
-    | tee "$LOGDIR/postgres_bench.log"
+sudo -u postgres pgbench -c 10 -t 100000 postgres |
+	tee "$LOGDIR/postgres_bench.log"
+
+sudo systemctl stop postgresql
 
 echo "[✓] PostgreSQL benchmark finalizado!"
-

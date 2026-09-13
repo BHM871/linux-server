@@ -184,6 +184,3 @@ sphinx_*/
 # Rust analyzer configuration
 /rust-project.json
 
-# Virtual segmentation rules
-mm/page_collector/benchmarks/setup.sh
-
