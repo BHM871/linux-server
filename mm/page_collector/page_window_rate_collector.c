@@ -164,13 +164,19 @@ static int proc_show(struct seq_file *m, void *v)
 
 	hash_for_each(pair_table, bkt, entry, node) {
 		long long c = (long long)atomic64_read(&entry->count);
-		seq_printf(m, "%llu,%llu,%lld\n",
+		seq_printf(m, "%llu,%llu,%lld\n", c,
 			   (unsigned long long)entry->key.a,
-			   (unsigned long long)entry->key.b, c);
+			   (unsigned long long)entry->key.b);
 		printed++;
 		if (printed >= max_report)
 			break;
 	}
+
+	seq_printf(
+		m,
+		"# params: on_ms=%u off_ms=%u sample_rate=%u buf_len=%u pair_hash_bits=%u max_report=%u\n",
+		on_ms, off_ms, sample_rate, buf_len, pair_hash_bits,
+		max_report);
 
 	seq_printf(m, "#stats events=%lld dropped=%lld pairs=%lld state=%s\n",
 		   (long long)atomic64_read(&stat_events),
