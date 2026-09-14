@@ -21,7 +21,7 @@ static unsigned int on_ms = 10; // collect window in ms
 static unsigned int off_ms = 90; // idle window in ms
 static unsigned long delta_ns = 10000000UL; // 10 ms default
 static unsigned int sample_rate = 1; // keep every Nth event (1 = no sampling)
-static unsigned int buf_len = 16384; // per-cpu buffer size (events)
+static unsigned int buf_len = 1024; // per-cpu buffer size (events)
 static unsigned int pair_hash_bits = 12; // hashtable size 2^bits
 static unsigned int max_report = 20000;
 
