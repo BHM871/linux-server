@@ -3,7 +3,7 @@
 LOGDIR="./bench_logs"
 mkdir -p "$LOGDIR"
 
-PROCFILE="/proc/page_rate_pairs"
+PROCFILE="/proc/page_window_rate_pairs"
 
 echo "[+] Limpando logs antigos..."
 rm -f $LOGDIR/*

@@ -8,8 +8,6 @@ sudo systemctl start memcached
 sleep 1
 
 echo "[+] Executando memtier_benchmark..."
-sudo apt install -y memtier-benchmark
-
 memtier_benchmark -p 11211 -s 127.0.0.1 \
 	--protocol=memcache_text \
 	--requests=200000 \
