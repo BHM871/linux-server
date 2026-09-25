@@ -10,6 +10,7 @@ sudo pacman -S stress-ng htop iotop sysstat curl wget
 
 echo "[+] Instalando Memcached..."
 sudo pacman -S memcached
+yay -S memtier_benchmark
 
 echo "[+] Instalando PostgreSQL..."
 sudo pacman -S postgresql
