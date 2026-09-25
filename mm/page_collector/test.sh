@@ -3,7 +3,7 @@
 MODULE=""
 PROCFILE=""
 TESTS=""
-VALUES=""
+FILETESTS=""
 LOGDIR="./benchmarks/bench_logs/"
 DATADIR="./datas_collected/"
 
@@ -39,6 +39,35 @@ function run_bench() {
 	echo "$time"
 }
 
+function run_test() {
+	local execution="$1"
+	local params="$2"
+
+	data_name=$(echo "$params" | awk -F, '{ if ($1 ~ /^name=/) { sub(/^name=/, "", $1); print $1 } }')
+	if [[ "$data_name" == "" ]]; then
+		echo "[x] Must define test name (Ex: \"name=test1,p1=v1,p2=v2;name=test2,p1=v3,p2=v4\")"
+		echo "[...] Passing test with params: $params"
+		return
+	fi
+
+	params=$(echo $params | sed 's/,/ /g')
+	echo "[...] Installing $MODULE with params: $params"
+	sudo insmod "$MODULE.ko" $params
+
+	sleep 1
+
+	echo "[...] Starting benchmarks"
+	timer=$(run_bench "$PROCFILE")
+	save_logs "$data_name" "$timer"
+
+	echo "[...] Removing $MODULE"
+	sudo rmmod "$MODULE"
+
+	echo "[✓] $executionº test finished"
+
+	sleep 3
+}
+
 function main() {
 	while [[ "$1" != "" ]]; do
 		case "$1" in
@@ -50,6 +79,9 @@ function main() {
 			;;
 		"-t" | "--tests")
 			TESTS=$(echo "$2" | sed "s/;/ /g")
+			;;
+		"-ft" | "--file-tests")
+			FILETESTS=$(cat "$2")
 			;;
 		esac
 
@@ -67,27 +99,31 @@ function main() {
 
 	mkdir -p "$DATADIR"
 
+	echo "[...] Starting normal test"
+
 	local timer=$(run_bench "none")
 	save_logs "normal" "$timer"
 
-	for params in $TESTS; do
+	echo "[✓] Normal test finished"
 
-		data_name=$(echo "$params" | awk -F, '{ if ($1 ~ /^name=/) { sub(/^name=/, "", $1); print $1 } }')
-		if [[ "$data_name" == "" ]]; then
-			echo "[x] Must define test name (Ex: \"name=test1,p1=v1,p2=v2;name=test2,p1=v3,p2=v4\")"
-			echo "[...] Passing test with params: $params"
-			continue
-		fi
+	echo "[...] Starting configured tests"
 
-		sudo insmod "$MODULE.ko" "$params"
+	local ti=1
+	if [[ "$FILETESTS" != "" ]]; then
+		for params in $FILETESTS; do
+			run_test "$ti" "$params"
+			ti=$((ti + 1))
+		done
+	fi
 
-		sleep 1
+	if [[ "$TESTS" != "" ]]; then
+		for params in $TESTS; do
+			run_test "$ti" "$params"
+			ti=$((ti + 1))
+		done
+	fi
 
-		timer=$(run_bench "$PROCFILE")
-		save_logs "$data_name" "$timer"
-
-		sudo rmmod "$MODULE"
-	done
+	echo "[✓] All tests finished"
 
 	sudo chown -R adrian "$DATADIR"
 }
