@@ -1,0 +1,11 @@
+name=rate2,sample_rate=2
+name=rate50,sample_rate=50
+name=rate75,sample_rate=75
+name=rate100,sample_rate=100
+name=rate250,sample_rate=250
+name=rate500,sample_rate=500
+name=rate1000,sample_rate=1000
+name=rate1500,sample_rate=1500
+name=rate2000,sample_rate=2000
+name=rate2500,sample_rate=2500
+name=rate5000,sample_rate=5000
