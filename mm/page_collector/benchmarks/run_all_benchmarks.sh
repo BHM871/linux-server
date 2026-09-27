@@ -27,26 +27,29 @@ start=$(date +%s%N)
 echo "[...] Running Workload..."
 ./run_workload.sh
 
-# echo "[...] Running stress-ng..."
-# ./run_stress_bench.sh
-#
-# echo "[...] Running Memcached benchmark..."
-# ./run_memcached_bench.sh
-#
-# echo "[...] Running PostgreSQL benchmark..."
-# ./run_postgres_bench.sh
-#
-# echo "[...] Running Nginx benchmark..."
-# ./run_nginx_bench.sh
+echo "[...] Running stress-ng..."
+./run_stress_bench.sh
+
+echo "[...] Running Memcached benchmark..."
+./run_memcached_bench.sh
+
+echo "[...] Running PostgreSQL benchmark..."
+./run_postgres_bench.sh
+
+echo "[...] Running Nginx benchmark..."
+./run_nginx_bench.sh
 
 end=$(date +%s%N)
 duration=$((end - start))
 
 if [[ $log -eq 1 ]]; then
 	echo "[+] Capturing final logs..."
-	cat $PROCFILE >"$LOGDIR/final_proc_dump.csv"
-	echo "# timers start: $start end: $end duration: $duration" >>"$LOGDIR/final_proc_dump.csv"
-	sort -n "$LOGDIR/final_proc_dump.csv" >"$LOGDIR/final_proc_dump.csv"
+
+	cat $PROCFILE >"$LOGDIR/final_proc_dump-tmp.csv"
+	echo "# timers start: $start end: $end duration: $duration" >>"$LOGDIR/final_proc_dump-tmp.csv"
+
+	sort -n "$LOGDIR/final_proc_dump-tmp.csv" >"$LOGDIR/final_proc_dump.csv"
+	rm "$LOGDIR/final_proc_dump-tmp.csv"
 fi
 
 echo "[✓] All benchmarks finished!"

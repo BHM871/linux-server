@@ -56,7 +56,7 @@ function run_test() {
 
 	sleep 1
 
-	echo "[...] Starting benchmarks"
+	echo "[...] Starting benchmarks at $(date '+%Hh %Mm %Ss %Nns')"
 	timer=$(run_bench "$PROCFILE")
 	save_logs "$data_name" "$timer"
 
