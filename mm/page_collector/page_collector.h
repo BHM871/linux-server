@@ -60,6 +60,12 @@ struct pair_entry {
 	atomic64_t count;
 };
 
+struct heap_pair_entry {
+	struct pair_entry *items;
+	int size;
+	int capacity;
+};
+
 /* per-cpu recent buffers */
 static struct recent_buf __percpu *pcpu_bufs = NULL;
 
@@ -71,6 +77,9 @@ static unsigned int bucket_lock_count = 256; // will be tuned
 static atomic64_t stat_events = ATOMIC64_INIT(0);
 static atomic64_t stat_dropped = ATOMIC64_INIT(0);
 static atomic64_t stat_pairs = ATOMIC64_INIT(0);
+
+// pair heap
+static struct heap_pair_entry heap;
 
 // #  Hashs
 
@@ -316,6 +325,80 @@ static void unregister_my_kprobes(void)
 }
 
 // # /proc
+
+// ---------------- ordenate -----------------
+static void heap_swap(struct heap_pair_entry *heap, int a, int b)
+{
+	struct pair_entry tmp = heap->items[a];
+	heap->items[a] = heap->items[b];
+	heap->items[b] = tmp;
+}
+
+static void heap_shift_up(struct heap_pair_entry *heap, int index)
+{
+	while (index > 0) {
+		int parent = (index - 1) / 2;
+
+		if (atomic64_read(&heap->items[parent].count) <=
+		    atomic64_read(&heap->items[index].count))
+			break;
+
+		heap_swap(heap, parent, index);
+		index = parent;
+	}
+}
+
+static void heap_shift_down(struct heap_pair_entry *heap, int index)
+{
+	while (index <= heap->capacity) {
+		int left = index * 2 + 1;
+		int rigth = index * 2 + 2;
+		int smallest = index;
+
+		if (left < heap->size &&
+		    atomic64_read(&heap->items[left].count) <
+			    atomic64_read(&heap->items[smallest].count))
+			smallest = left;
+
+		if (rigth < heap->size &&
+		    atomic64_read(&heap->items[rigth].count) <
+			    atomic64_read(&heap->items[smallest].count))
+			smallest = rigth;
+
+		if (smallest == index)
+			break;
+
+		heap_swap(heap, smallest, index);
+		index = smallest;
+	}
+}
+
+static void heap_push(struct heap_pair_entry *heap, struct pair_entry entry)
+{
+	if (heap->size < heap->capacity) {
+		heap->items[heap->size] = entry;
+		heap_shift_up(heap, heap->size);
+		heap->size++;
+
+		return;
+	}
+
+	if (atomic64_read(&entry.count) <= atomic64_read(&heap->items[0].count))
+		return;
+
+	heap->items[0] = entry;
+	heap_shift_down(heap, 0);
+}
+
+static void fill_heap_pair_entry(void)
+{
+	struct pair_entry *entry;
+	unsigned int bkt;
+
+	hash_for_each(pair_table, bkt, entry, node) {
+		heap_push(&heap, *entry);
+	}
+}
 
 // ---------------- proc read ----------------
 static int proc_show(struct seq_file *m, void *v);

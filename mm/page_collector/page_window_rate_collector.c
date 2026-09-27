@@ -159,18 +159,8 @@ static enum hrtimer_restart window_timer_cb(struct hrtimer *timer)
 static int proc_show(struct seq_file *m, void *v)
 {
 	struct pair_entry *entry;
-	unsigned int bkt;
-	unsigned long printed = 0;
 
-	hash_for_each(pair_table, bkt, entry, node) {
-		long long c = (long long)atomic64_read(&entry->count);
-		seq_printf(m, "%llu,%llu,%lld\n", c,
-			   (unsigned long long)entry->key.a,
-			   (unsigned long long)entry->key.b);
-		printed++;
-		if (printed >= max_report)
-			break;
-	}
+	fill_heap_pair_entry();
 
 	seq_printf(
 		m,
@@ -183,6 +173,15 @@ static int proc_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&stat_dropped),
 		   (long long)atomic64_read(&stat_pairs),
 		   cur_state == WINDOW_ON ? "ON" : "OFF");
+
+	for (int i = 0; i < max_report; i++) {
+		entry = &heap.items[i];
+
+		long long c = (long long)atomic64_read(&entry->count);
+		seq_printf(m, "%lld,%llu,%llu\n", c,
+			   (unsigned long long)entry->key.a,
+			   (unsigned long long)entry->key.b);
+	}
 	return 0;
 }
 
@@ -228,6 +227,11 @@ static int __init pw_init(void)
 	if (!proc_entry) {
 		pr_warn("%s: failed to create /proc/%s\n", MODULE_NAME,
 			PROC_NAME);
+	} else {
+		heap.items = kmalloc_array(
+			max_report, sizeof(struct pair_entry), GFP_KERNEL);
+		heap.size = 0;
+		heap.capacity = max_report;
 	}
 
 	register_my_kprobes();
@@ -275,6 +279,7 @@ static void __exit pw_exit(void)
 	if (proc_entry) {
 		proc_remove(proc_entry);
 		proc_entry = NULL;
+		kfree(heap.items);
 	}
 
 	// free pair table
