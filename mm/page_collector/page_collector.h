@@ -221,17 +221,22 @@ static unsigned int snapshot_percpu_buffer(int cpu, struct page_event *out_buf,
 {
 	struct recent_buf *rb = per_cpu_ptr(pcpu_bufs, cpu);
 	unsigned long flags;
-	unsigned int cnt, idx, i;
+	unsigned int cmax, cnt = 0, idx, i;
 
 	spin_lock_irqsave(&rb->lock, flags);
-	cnt = rb->count;
-	if (cnt > max_items)
-		cnt = max_items;
+	cmax = rb->count;
+	if (cmax > max_items)
+		cmax = max_items;
 
 	// oldest idx:
 	idx = (rb->head - rb->count + buf_len) % buf_len;
-	for (i = 0; i < cnt; ++i)
-		out_buf[i] = rb->buf[(idx + i) % buf_len];
+	for (i = 0; i < cmax; ++i) {
+		struct page_event p = rb->buf[(idx + i) % buf_len];
+		if (!p.id)
+			continue;
+
+		out_buf[cnt++] = p;
+	}
 
 	spin_unlock_irqrestore(&rb->lock, flags);
 	return cnt;
@@ -304,13 +309,13 @@ static int register_my_kprobes(void)
 {
 	int ret;
 	ret = register_kprobe(&kp_mark_page);
-	if (ret < 0) {
+	if (ret) {
 		pr_warn("%s: failed to register kprobe mark_page_accessed: %d\n",
 			MODULE_NAME, ret);
 		// continue attempt for the other
 	}
 	ret = register_kprobe(&kp_handle_fault);
-	if (ret < 0) {
+	if (ret) {
 		pr_warn("%s: failed to register kprobe handle_mm_fault: %d\n",
 			MODULE_NAME, ret);
 		// still ok to run with only one probe

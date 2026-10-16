@@ -34,12 +34,14 @@ MODULE_PARM_DESC(pair_hash_bits,
 module_param(max_report, uint, 0644);
 MODULE_PARM_DESC(max_report, "Max entries printed via /proc");
 
-enum window_state { WINDOW_OFF = 0, WINDOW_ON = 1 };
+enum window_state { WINDOW_OFF = 0, WINDOW_ON = 1, WINDOW_LOCK = 2 };
 static enum window_state cur_state = WINDOW_OFF;
 
 // workqueue for processing window end
+static struct file *events_file;
+static loff_t events_file_pos;
 static struct workqueue_struct *pw_wq;
-static struct delayed_work process_work;
+static struct work_struct process_work;
 static unsigned int process_interval_ms = 100;
 
 // timer
@@ -51,7 +53,82 @@ static ktime_t kt_off;
 #define PROC_NAME "page_window_rate_pairs"
 static struct proc_dir_entry *proc_entry = NULL;
 
+// #  Events
+
+// ---------------- push event ----------------
+static void push_event_if_possible(u64 id)
+{
+	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
+
+	if (rb->head == 0 && rb->count != 0) {
+		cur_state = WINDOW_LOCK;
+
+		// schedule processing on workqueue
+		if (pw_wq)
+			queue_work(pw_wq, &process_work);
+	}
+
+	push_event_to_percpu(id);
+}
+
+// ---------------- file helper ----------------
+
+static int open_events_file(void)
+{
+	events_file = filp_open("/tmp/page_window_rate_events.bin",
+				O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+	if (IS_ERR(events_file)) {
+		int ret = PTR_ERR(events_file);
+		events_file = NULL;
+		return ret;
+	}
+
+	events_file_pos = 0;
+	return 0;
+}
+
+static void write_events(struct work_struct *work)
+{
+	if (!events_file) {
+		return;
+	}
+
+	int cpu;
+	unsigned int max_items = buf_len;
+	struct page_event *snap = NULL;
+
+	// allocate snapshot buffer once (per CPU we reuse)
+	snap = kmalloc_array(max_items, sizeof(struct page_event), GFP_KERNEL);
+	if (!snap) {
+		pr_warn("%s: cannot allocate snapshot buffer\n", MODULE_NAME);
+		return;
+	}
+
+	for_each_possible_cpu(cpu) {
+		unsigned int cnt = snapshot_percpu_buffer(cpu, snap, max_items);
+		if (cnt == 0)
+			continue;
+
+		kernel_write(events_file, snap, cnt * sizeof(struct page_event),
+			     &events_file_pos);
+	}
+
+	kfree(snap);
+
+	cur_state = WINDOW_ON;
+}
+
+static void close_events_file(void)
+{
+	if (events_file) {
+		filp_close(events_file, NULL);
+		events_file = NULL;
+	}
+}
+
 // ---------------- processing: consume snapshots and compute pairs ----------------
+// ------------- UNUSED EXCERPT START -------------
 static void process_window_work(struct work_struct *work)
 {
 	int cpu;
@@ -94,7 +171,7 @@ static void schedule_processing(unsigned long delay_ms)
 {
 	if (!pw_wq)
 		return;
-	queue_delayed_work(pw_wq, &process_work, msecs_to_jiffies(delay_ms));
+	queue_work(pw_wq, &process_work);
 }
 
 static void process_work_fn(struct work_struct *work)
@@ -103,30 +180,32 @@ static void process_work_fn(struct work_struct *work)
 	// reschedule periodic processing (keeps sampling up-to-date)
 	schedule_processing(process_interval_ms);
 }
+// ------------- UNUSED EXCERPT END -------------
 
 // ---------------- kprobe handler (hot path) ----------------
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 #ifdef CONFIG_X86_64
-	if (cur_state == WINDOW_ON) {
+	if (cur_state == WINDOW_ON && p && p->symbol_name) {
 		u64 id = 0;
-		if (p && p->symbol_name &&
-		    strcmp(p->symbol_name, "mark_page_accessed") == 1) {
+		if (strcmp(p->symbol_name, "mark_page_accessed") == 0) {
 			// mark_page_accessed(struct page *page)
 			void *page_ptr = (void *)regs->di;
 			if (page_ptr) {
 				struct page *pg = (struct page *)page_ptr;
 				unsigned long pfn = page_to_pfn(pg);
 				id = ID_IS_PFN_FLAG | (u64)pfn;
-				push_event_to_percpu(id);
+				push_event_if_possible(id);
 			}
 		} else if (strcmp(p->symbol_name, "handle_mm_fault") == 0) {
 			// handle_mm_fault(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
 			unsigned long address = (unsigned long)regs->si;
-			u64 page_idx = (u64)(address >> PAGE_SHIFT);
+			u64 page_idx = (u64)(address & PAGE_MASK);
 			id = page_idx; // MSB clear
-			push_event_to_percpu(id);
+			push_event_if_possible(id);
 		}
+	} else if (cur_state == WINDOW_LOCK) {
+		atomic64_inc(&stat_dropped);
 	}
 #endif
 	return 0;
@@ -135,6 +214,9 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 // ---------------- timer callback (switch windows) ----------------
 static enum hrtimer_restart window_timer_cb(struct hrtimer *timer)
 {
+	if (cur_state == WINDOW_LOCK)
+		return HRTIMER_RESTART;
+
 	// toggle state
 	if (cur_state == WINDOW_OFF) {
 		// turn ON: start on timer and set state
@@ -158,9 +240,7 @@ static enum hrtimer_restart window_timer_cb(struct hrtimer *timer)
 // ---------------- proc read ----------------
 static int proc_show(struct seq_file *m, void *v)
 {
-	struct pair_entry *entry;
-
-	fill_heap_pair_entry();
+	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
 
 	seq_printf(
 		m,
@@ -168,20 +248,16 @@ static int proc_show(struct seq_file *m, void *v)
 		on_ms, off_ms, sample_rate, buf_len, pair_hash_bits,
 		max_report);
 
-	seq_printf(m, "#stats events=%lld dropped=%lld pairs=%lld state=%s\n",
-		   (long long)atomic64_read(&stat_events),
-		   (long long)atomic64_read(&stat_dropped),
-		   (long long)atomic64_read(&stat_pairs),
-		   cur_state == WINDOW_ON ? "ON" : "OFF");
+	seq_printf(
+		m,
+		"#stats events=%lld dropped=%lld pairs=%lld state=%d (0=off 1=on 2=lock)\n",
+		(long long)atomic64_read(&stat_events),
+		(long long)atomic64_read(&stat_dropped),
+		(long long)atomic64_read(&stat_pairs), cur_state);
 
-	for (int i = 0; i < max_report; i++) {
-		entry = &heap.items[i];
+	seq_printf(m, "#this cpu buffer: head=%d count=%d\n", rb->head,
+		   rb->count);
 
-		long long c = (long long)atomic64_read(&entry->count);
-		seq_printf(m, "%lld,%llu,%llu\n", c,
-			   (unsigned long long)entry->key.a,
-			   (unsigned long long)entry->key.b);
-	}
 	return 0;
 }
 
@@ -209,7 +285,8 @@ static int __init pw_init(void)
 	if (ret) {
 		pr_err("%s: failed to alloc per-cpu buffers: %d\n", MODULE_NAME,
 		       ret);
-		goto err_no_bufs;
+		free_bucket_locks();
+		return ret;
 	}
 
 	// create workqueue and init work
@@ -217,10 +294,14 @@ static int __init pw_init(void)
 	if (!pw_wq) {
 		pr_err("%s: failed to create workqueue\n", MODULE_NAME);
 		ret = -ENOMEM;
-		goto err_free_bufs;
+		free_percpu_buffers();
 	}
-	INIT_DELAYED_WORK(&process_work, process_work_fn);
-	schedule_processing(process_interval_ms);
+	if (pw_wq && open_events_file()) {
+		pr_err("%s: failed to open events file\n", MODULE_NAME);
+		ret = -ENOMEM;
+	}
+	INIT_WORK(&process_work, write_events);
+	// schedule_processing(process_interval_ms);
 
 	// create proc
 	proc_entry = proc_create(PROC_NAME, 0444, NULL, &proc_fops);
@@ -250,12 +331,6 @@ static int __init pw_init(void)
 
 	pr_info("%s: module loaded\n", MODULE_NAME);
 	return 0;
-
-err_free_bufs:
-	free_percpu_buffers();
-err_no_bufs:
-	free_bucket_locks();
-	return ret;
 }
 
 static void __exit pw_exit(void)
@@ -270,9 +345,10 @@ static void __exit pw_exit(void)
 
 	// cancel work and destroy wq
 	if (pw_wq) {
-		cancel_delayed_work_sync(&process_work);
+		cancel_work_sync(&process_work);
 		destroy_workqueue(pw_wq);
 		pw_wq = NULL;
+		close_events_file();
 	}
 
 	// remove proc entry
