@@ -60,6 +60,13 @@ struct pair_entry {
 	atomic64_t count;
 };
 
+struct processor_count {
+	struct hlist_node node;
+	pid_t pid;
+	atomic64_t total;
+	atomic64_t dropped;
+};
+
 struct heap_pair_entry {
 	struct pair_entry *items;
 	int size;
@@ -70,6 +77,8 @@ struct heap_pair_entry {
 static struct recent_buf __percpu *pcpu_bufs = NULL;
 
 static DEFINE_HASHTABLE(pair_table, 12); // initialize later with param
+static DEFINE_HASHTABLE(processors_table, 12);
+
 static spinlock_t *bucket_locks = NULL; // array of locks for hash buckets
 static unsigned int bucket_lock_count = 256; // will be tuned
 
@@ -177,6 +186,54 @@ static void free_bucket_locks(void)
 	}
 }
 
+// #  Processors Table
+
+// ---------------- pair table manipulation ----------------
+static void processors_table_inc(pid_t pid, u64 page, bool dropped)
+{
+	struct processor_count *entry;
+	u32 bucket = pid & ((1u << pair_hash_bits) - 1);
+	unsigned int li = lock_index_for_bucket(bucket);
+
+	if (!bucket_locks)
+		return;
+
+	spin_lock(&bucket_locks[li]);
+	hash_for_each_possible(processors_table, entry, node, pid) {
+		if (entry->pid == pid) {
+			if (dropped)
+				atomic64_inc(&entry->dropped);
+			atomic64_inc(&entry->total);
+			spin_unlock(&bucket_locks[li]);
+			return;
+		}
+	}
+
+	// not found -> create
+	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	if (!entry) {
+		spin_unlock(&bucket_locks[li]);
+	}
+
+	entry->pid = pid;
+	atomic64_set(&entry->total, 1);
+	atomic64_set(&entry->dropped, dropped);
+
+	hash_add(processors_table, &entry->node, pid);
+
+	spin_unlock(&bucket_locks[li]);
+}
+
+static void free_processors_table(void)
+{
+	struct processor_count *entry;
+	unsigned bkt;
+	hash_for_each(processors_table, bkt, entry, node) {
+		hash_del(&entry->node);
+		kfree(entry);
+	}
+}
+
 // #  Events
 
 // ---------------- push event (hot path) ----------------
@@ -190,6 +247,8 @@ static void push_event_to_percpu(u64 id)
 		if ((atomic64_read(&stat_events) % sample_rate) != 0) {
 			atomic64_inc(&stat_dropped);
 			atomic64_inc(&stat_events);
+
+			processors_table_inc(current->pid, id, 1);
 			return;
 		}
 	}
@@ -205,6 +264,8 @@ static void push_event_to_percpu(u64 id)
 
 	if (rb->count < buf_len)
 		rb->count++;
+
+	processors_table_inc(current->pid, id, 0);
 
 	spin_unlock_irqrestore(&rb->lock, flags);
 

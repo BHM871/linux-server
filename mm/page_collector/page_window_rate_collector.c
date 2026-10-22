@@ -250,13 +250,22 @@ static int proc_show(struct seq_file *m, void *v)
 
 	seq_printf(
 		m,
-		"#stats events=%lld dropped=%lld pairs=%lld state=%d (0=off 1=on 2=lock)\n",
+		"# stats events=%lld dropped=%lld pairs=%lld state=%d (0=off 1=on 2=lock)\n",
 		(long long)atomic64_read(&stat_events),
 		(long long)atomic64_read(&stat_dropped),
 		(long long)atomic64_read(&stat_pairs), cur_state);
 
-	seq_printf(m, "#this cpu buffer: head=%d count=%d\n", rb->head,
+	seq_printf(m, "# this cpu buffer: head=%d count=%d\n", rb->head,
 		   rb->count);
+
+	struct processor_count *entry;
+	unsigned bkt;
+	hash_for_each(processors_table, bkt, entry, node) {
+		seq_printf(m, "pid=%i total=%lld dropped=%lld\n",
+			   (unsigned int)entry->pid,
+			   (long long)atomic64_read(&entry->total),
+			   (long long)atomic64_read(&entry->dropped));
+	}
 
 	return 0;
 }
@@ -277,6 +286,8 @@ static int __init pw_init(void)
 
 	// init hash table with chosen bits
 	hash_init(pair_table);
+	hash_init(processors_table);
+
 	// allocate bucket locks using number of buckets
 	init_bucket_locks(1u << pair_hash_bits);
 
@@ -360,6 +371,7 @@ static void __exit pw_exit(void)
 
 	// free pair table
 	free_pair_table();
+	free_processors_table();
 
 	// free per-cpu buffers
 	free_percpu_buffers();
