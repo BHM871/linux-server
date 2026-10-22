@@ -187,6 +187,54 @@ static void free_bucket_locks(void)
 	}
 }
 
+// #  Pair Table
+
+// ---------------- pair table manipulation ----------------
+static void pair_table_inc(u64 a, u64 b)
+{
+	struct pair_entry *entry;
+	u32 h32 = pair_hash_u64(a, b);
+	u32 bucket = h32 & ((1u << pair_hash_bits) - 1);
+	unsigned int li = lock_index_for_bucket(bucket);
+
+	if (!bucket_locks)
+		return;
+
+	spin_lock(&bucket_locks[li]);
+	hash_for_each_possible(pair_table, entry, node, h32) {
+		if (entry->key.a == a && entry->key.b == b) {
+			atomic64_inc(&entry->count);
+			spin_unlock(&bucket_locks[li]);
+			atomic64_inc(&stat_pairs);
+			return;
+		}
+	}
+
+	// not found -> create
+	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	if (!entry) {
+		spin_unlock(&bucket_locks[li]);
+	}
+
+	entry->key.a = a;
+	entry->key.b = b;
+	atomic64_set(&entry->count, 1);
+	hash_add(pair_table, &entry->node, h32);
+
+	spin_unlock(&bucket_locks[li]);
+	atomic64_inc(&stat_pairs);
+}
+
+static void free_pair_table(void)
+{
+	struct pair_entry *entry;
+	unsigned bkt;
+	hash_for_each(pair_table, bkt, entry, node) {
+		hash_del(&entry->node);
+		kfree(entry);
+	}
+}
+
 // #  Processors Table
 
 // ---------------- pair table manipulation ----------------

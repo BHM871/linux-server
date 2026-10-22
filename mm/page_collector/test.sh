@@ -26,6 +26,11 @@ function save_logs() {
 		fi
 	done
 
+	if [[ "$log_name" != "normal.log" ]]; then
+		python ./converter.py
+		mv "page_events.csv" "$DATADIR/events_$1.csv"
+	fi
+
 	echo "$timers" >>"$DATADIR/$log_name"
 }
 
@@ -49,6 +54,8 @@ function run_test() {
 		echo "[...] Passing test with params: $params"
 		return
 	fi
+
+	sudo rm /tmp/page_window_rate_events.bin
 
 	params=$(echo $params | sed 's/,/ /g')
 	echo "[...] Installing $MODULE with params: $params"

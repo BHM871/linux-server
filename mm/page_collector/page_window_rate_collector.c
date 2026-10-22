@@ -130,8 +130,8 @@ static void close_events_file(void)
 	}
 }
 
+/* ------------- UNUSED EXCERPT START -------------
 // ---------------- processing: consume snapshots and compute pairs ----------------
-// ------------- UNUSED EXCERPT START -------------
 static void process_window_work(struct work_struct *work)
 {
 	int cpu;
@@ -183,7 +183,7 @@ static void process_work_fn(struct work_struct *work)
 	// reschedule periodic processing (keeps sampling up-to-date)
 	schedule_processing(process_interval_ms);
 }
-// ------------- UNUSED EXCERPT END -------------
+// ------------- UNUSED EXCERPT END -------------*/
 
 // ---------------- kprobe handler (hot path) ----------------
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)

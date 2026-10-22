@@ -45,11 +45,8 @@ duration=$((end - start))
 if [[ $log -eq 1 ]]; then
 	echo "[+] Capturing final logs..."
 
-	cat $PROCFILE >"$LOGDIR/final_proc_dump-tmp.csv"
-	echo "# timers start: $start end: $end duration: $duration" >>"$LOGDIR/final_proc_dump-tmp.csv"
-
-	sort -n "$LOGDIR/final_proc_dump-tmp.csv" >"$LOGDIR/final_proc_dump.csv"
-	rm "$LOGDIR/final_proc_dump-tmp.csv"
+	cat $PROCFILE >"$LOGDIR/final_proc_dump.csv"
+	echo "# timers start: $start end: $end duration: $duration" >>"$LOGDIR/final_proc_dump.csv"
 fi
 
 echo "[✓] All benchmarks finished!"
