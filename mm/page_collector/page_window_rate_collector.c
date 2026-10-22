@@ -9,7 +9,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("TCC - Windowed Collector");
 MODULE_DESCRIPTION(
-	"Windowed collector for page-access co-occurrence (mark_page_accessed + handle_mm_fault)");
+	"Windowed collector for page-access co-occurrence (folio_mark_accessed + handle_mm_fault)");
 MODULE_VERSION("0.3");
 
 // ---------------- module parameters ----------------
@@ -48,6 +48,9 @@ static unsigned int process_interval_ms = 100;
 static struct hrtimer window_timer;
 static ktime_t kt_on;
 static ktime_t kt_off;
+
+static atomic64_t folio_mark_hits = ATOMIC_INIT(0);
+static atomic64_t handle_fault_hits = ATOMIC_INIT(0);
 
 // /proc
 #define PROC_NAME "page_window_rate_pairs"
@@ -186,27 +189,29 @@ static void process_work_fn(struct work_struct *work)
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 #ifdef CONFIG_X86_64
-	if (cur_state == WINDOW_ON && p && p->symbol_name) {
-		u64 id = 0;
-		if (strcmp(p->symbol_name, "mark_page_accessed") == 0) {
-			// mark_page_accessed(struct page *page)
-			void *page_ptr = (void *)regs->di;
-			if (page_ptr) {
-				struct page *pg = (struct page *)page_ptr;
-				unsigned long pfn = page_to_pfn(pg);
-				id = ID_IS_PFN_FLAG | (u64)pfn;
-				push_event_if_possible(id);
-			}
-		} else if (strcmp(p->symbol_name, "handle_mm_fault") == 0) {
-			// handle_mm_fault(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
-			unsigned long address = (unsigned long)regs->si;
-			u64 page_idx = (u64)(address & PAGE_MASK);
-			id = page_idx; // MSB clear
-			push_event_if_possible(id);
+	if (READ_ONCE(cur_state) != WINDOW_ON)
+		return 0;
+
+	u64 id = 0;
+	char type = '-';
+	if (p == &kp_folio_mark) {
+		atomic64_inc(&folio_mark_hits);
+		type = 'F';
+
+		struct folio *folio = (struct folio *)regs->di;
+		if (folio) {
+			unsigned long pfn = folio_pfn(folio);
+			id = ID_IS_PFN_FLAG | (u64)pfn;
 		}
-	} else if (cur_state == WINDOW_LOCK) {
-		atomic64_inc(&stat_dropped);
+	} else if (p == &kp_handle_fault) {
+		atomic64_inc(&handle_fault_hits);
+		type = 'H';
+
+		unsigned long address = (unsigned long)regs->si;
+		id = (u64)(address & PAGE_MASK);
 	}
+
+	push_event_if_possible(id, type);
 #endif
 	return 0;
 }
@@ -257,6 +262,10 @@ static int proc_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "# this cpu buffer: head=%d count=%d\n", rb->head,
 		   rb->count);
+
+	seq_printf(m, "# kprobes: folio_mark=%lld handle_fault=%lld\n",
+		   (long long)atomic64_read(&folio_mark_hits),
+		   (long long)atomic64_read(&handle_fault_hits));
 
 	struct processor_count *entry;
 	unsigned bkt;

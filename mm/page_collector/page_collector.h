@@ -303,61 +303,13 @@ static unsigned int snapshot_percpu_buffer(int cpu, struct page_event *out_buf,
 	return cnt;
 }
 
-// #  Pair Table
-
-// ---------------- pair table manipulation ----------------
-static void pair_table_inc(u64 a, u64 b)
-{
-	struct pair_entry *entry;
-	u32 h32 = pair_hash_u64(a, b);
-	u32 bucket = h32 & ((1u << pair_hash_bits) - 1);
-	unsigned int li = lock_index_for_bucket(bucket);
-
-	if (!bucket_locks)
-		return;
-
-	spin_lock(&bucket_locks[li]);
-	hash_for_each_possible(pair_table, entry, node, h32) {
-		if (entry->key.a == a && entry->key.b == b) {
-			atomic64_inc(&entry->count);
-			spin_unlock(&bucket_locks[li]);
-			atomic64_inc(&stat_pairs);
-			return;
-		}
-	}
-
-	// not found -> create
-	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
-	if (!entry) {
-		spin_unlock(&bucket_locks[li]);
-	}
-
-	entry->key.a = a;
-	entry->key.b = b;
-	atomic64_set(&entry->count, 1);
-	hash_add(pair_table, &entry->node, h32);
-
-	spin_unlock(&bucket_locks[li]);
-	atomic64_inc(&stat_pairs);
-}
-
-static void free_pair_table(void)
-{
-	struct pair_entry *entry;
-	unsigned bkt;
-	hash_for_each(pair_table, bkt, entry, node) {
-		hash_del(&entry->node);
-		kfree(entry);
-	}
-}
-
 // #  Handles
 
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs);
 
 // register/unregister kprobes
-static struct kprobe kp_mark_page = {
-	.symbol_name = "mark_page_accessed",
+static struct kprobe kp_folio_mark = {
+	.symbol_name = "folio_mark_accessed",
 	.pre_handler = kp_pre_handler,
 };
 
@@ -369,24 +321,22 @@ static struct kprobe kp_handle_fault = {
 static int register_my_kprobes(void)
 {
 	int ret;
-	ret = register_kprobe(&kp_mark_page);
+	ret = register_kprobe(&kp_folio_mark);
 	if (ret) {
-		pr_warn("%s: failed to register kprobe mark_page_accessed: %d\n",
+		pr_warn("%s: failed to register kprobe folio_mark_accessed: %d\n",
 			MODULE_NAME, ret);
-		// continue attempt for the other
 	}
 	ret = register_kprobe(&kp_handle_fault);
 	if (ret) {
 		pr_warn("%s: failed to register kprobe handle_mm_fault: %d\n",
 			MODULE_NAME, ret);
-		// still ok to run with only one probe
 	}
 	return 0;
 }
 
 static void unregister_my_kprobes(void)
 {
-	unregister_kprobe(&kp_mark_page);
+	unregister_kprobe(&kp_folio_mark);
 	unregister_kprobe(&kp_handle_fault);
 }
 

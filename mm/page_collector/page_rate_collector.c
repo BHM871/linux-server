@@ -10,7 +10,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("TCC - Instrumentation");
 MODULE_DESCRIPTION(
-	"Lightweight page access pair collector (mark_page_accessed + handle_mm_fault)");
+	"Lightweight page access pair collector (folio_mark_accessed + handle_mm_fault)");
 MODULE_VERSION("0.1");
 
 // ----------------- module parameters -----------------
@@ -102,26 +102,16 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	u64 id = 0;
 	// note: this handler runs on x86_64 assumptions (first arg in regs->di, second in regs->si)
 #ifdef CONFIG_X86_64
-	if (p->symbol_name &&
-	    strcmp(p->symbol_name, "mark_page_accessed") == 0) {
-		// mark_page_accessed(struct page *page)
-		void *page_ptr = (void *)regs->di;
-		if (page_ptr) {
-			// page_to_pfn is macro, but we use page_to_pfn(page_ptr)
-			// cast: 'struct page *' from void*
-			struct page *pg = (struct page *)page_ptr;
-			unsigned long pfn = page_to_pfn(pg);
+	if (p == &kp_folio_mark) {
+		struct folio *folio = (struct folio *)regs->di;
+		if (folio) {
+			unsigned long pfn = folio_pfn(folio);
 			id = ID_IS_PFN_FLAG | (u64)pfn;
-			push_event_to_percpu(id);
 		}
-	} else if (p->symbol_name &&
-		   strcmp(p->symbol_name, "handle_mm_fault") == 0) {
-		// handle_mm_fault(struct vm_area_struct *vma, unsigned long address, unsigned int flags)
+	} else if (p == &kp_handle_fault) {
 		unsigned long address = (unsigned long)regs->si;
-		// we store page-index of address (vaddr >> PAGE_SHIFT)
-		u64 page_idx = (u64)(address >> PAGE_SHIFT);
-		id = page_idx; // MSB = 0 indicates vaddr-page-index
-		push_event_to_percpu(id);
+		id = (u64)(address & PAGE_MASK);
+		push_event_to_percpu(id, 'H');
 	}
 #endif
 	return 0;
