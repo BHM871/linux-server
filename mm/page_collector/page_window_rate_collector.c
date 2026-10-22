@@ -59,7 +59,7 @@ static struct proc_dir_entry *proc_entry = NULL;
 // #  Events
 
 // ---------------- push event ----------------
-static void push_event_if_possible(u64 id)
+static void push_event_if_possible(u64 id, char type)
 {
 	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
 
@@ -71,7 +71,7 @@ static void push_event_if_possible(u64 id)
 			queue_work(pw_wq, &process_work);
 	}
 
-	push_event_to_percpu(id);
+	push_event_to_percpu(id, type);
 }
 
 // ---------------- file helper ----------------

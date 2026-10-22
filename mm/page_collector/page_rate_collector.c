@@ -99,20 +99,22 @@ static void process_all_buffers(struct work_struct *work)
 // ----------------- kprobe handlers -----------------
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	u64 id = 0;
-	// note: this handler runs on x86_64 assumptions (first arg in regs->di, second in regs->si)
 #ifdef CONFIG_X86_64
+	u64 id = 0;
+	char type = '-';
 	if (p == &kp_folio_mark) {
+		type = 'F';
 		struct folio *folio = (struct folio *)regs->di;
 		if (folio) {
 			unsigned long pfn = folio_pfn(folio);
 			id = ID_IS_PFN_FLAG | (u64)pfn;
 		}
 	} else if (p == &kp_handle_fault) {
+		type = 'H';
 		unsigned long address = (unsigned long)regs->si;
 		id = (u64)(address & PAGE_MASK);
-		push_event_to_percpu(id, 'H');
 	}
+	push_event_to_percpu(id, type);
 #endif
 	return 0;
 }

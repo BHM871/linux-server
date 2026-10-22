@@ -36,6 +36,7 @@ struct page_event {
 	pid_t pid;
 	// either (ID_IS_PFN_FLAG | pfn) or (vaddr >> PAGE_SHIFT)
 	u64 id;
+	char type;
 };
 
 struct recent_buf {
@@ -237,7 +238,7 @@ static void free_processors_table(void)
 // #  Events
 
 // ---------------- push event (hot path) ----------------
-static void push_event_to_percpu(u64 id)
+static void push_event_to_percpu(u64 id, char type)
 {
 	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
 	unsigned long flags;
@@ -259,6 +260,7 @@ static void push_event_to_percpu(u64 id)
 	rb->buf[rb->head].ts_ns = ktime_get_ns();
 	rb->buf[rb->head].pid = current->pid;
 	rb->buf[rb->head].id = id;
+	rb->buf[rb->head].type = type;
 	rb->head = (rb->head + 1) % buf_len;
 	rb->count++;
 
