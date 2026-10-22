@@ -20,7 +20,7 @@
 static unsigned int on_ms = 10; // collect window in ms
 static unsigned int off_ms = 90; // idle window in ms
 static unsigned long delta_ns = 10000000UL; // 10 ms default
-static unsigned int sample_rate = 1; // keep every Nth event (1 = no sampling)
+static unsigned int sample_rate = 2; // keep every Nth event (1 = no sampling)
 static unsigned int buf_len = 1024; // per-cpu buffer size (events)
 static unsigned int pair_hash_bits = 12; // hashtable size 2^bits
 static unsigned int max_report = 20000;
@@ -291,15 +291,13 @@ static void push_event_to_percpu(u64 id, char type)
 	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
 	unsigned long flags;
 
-	if (sample_rate > 1) {
-		// simple sampling based on total events (not perfect but ok)
-		if ((atomic64_read(&stat_events) % sample_rate) != 0) {
-			atomic64_inc(&stat_dropped);
-			atomic64_inc(&stat_events);
+	// simple sampling based on total events (not perfect but ok)
+	if ((atomic64_read(&stat_events) % sample_rate) != 0) {
+		atomic64_inc(&stat_dropped);
+		atomic64_inc(&stat_events);
 
-			processors_table_inc(current->pid, id, 1);
-			return;
-		}
+		processors_table_inc(current->pid, id, 1);
+		return;
 	}
 
 	// Very small fast critical section
