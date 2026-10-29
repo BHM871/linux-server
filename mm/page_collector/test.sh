@@ -4,6 +4,7 @@ MODULE=""
 PROCFILE=""
 TESTS=""
 FILETESTS=""
+NOTIFIER=""
 LOGDIR="./benchmarks/bench_logs/"
 DATADIR="./datas_collected/"
 
@@ -17,7 +18,9 @@ function save_logs() {
 		local file_name=$(echo $file | cut -d '/' -f 2)
 		local initial_name=$(echo $file_name | cut -d '_' -f 1)
 
-		if [[ "$initial_name" != "initial" && "$initial_name" != "final" ]]; then
+		if [[ "$file_name" == "pids" ]]; then
+			cp "$LOGDIR/$file" "$DATADIR/$file_name-$log_name"
+		elif [[ "$initial_name" != "initial" && "$initial_name" != "final" ]]; then
 			cat "$LOGDIR/$file" >>"$DATADIR/$log_name"
 			echo "------------------------------------------------------------------------------------" >>"$DATADIR/$log_name"
 			echo "------------------------------------------------------------------------------------" >>"$DATADIR/$log_name"
@@ -75,6 +78,12 @@ function run_test() {
 	sleep 3
 }
 
+function shout() {
+	export XDG_RUNTIME_DIR="/run/user/$(sudo --user=$SUDO_USER id -u)"
+	export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+	ffplay -nodisp -autoexit -loglevel error -volume 100 -nodisp "$NOTIFIER"
+}
+
 function main() {
 	while [[ "$1" != "" ]]; do
 		case "$1" in
@@ -89,6 +98,9 @@ function main() {
 			;;
 		"-ft" | "--file-tests")
 			FILETESTS=$(cat "$2")
+			;;
+		"-n" | "--notifier")
+			NOTIFIER="$2"
 			;;
 		esac
 
@@ -133,6 +145,8 @@ function main() {
 	echo "[✓] All tests finished"
 
 	sudo chown -R adrian "$DATADIR"
+
+	[[ "$NOTIFIER" != "" ]] && shout
 }
 
 main "$@"
