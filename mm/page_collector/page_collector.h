@@ -34,9 +34,11 @@ static unsigned int max_report = 20000;
 struct page_event {
 	u64 ts_ns;
 	pid_t pid;
+	pid_t tgid;
 	// either (ID_IS_PFN_FLAG | pfn) or (vaddr >> PAGE_SHIFT)
 	u64 id;
 	char type;
+	char comm[TASK_COMM_LEN];
 };
 
 struct recent_buf {
@@ -64,6 +66,7 @@ struct pair_entry {
 struct processor_count {
 	struct hlist_node node;
 	pid_t pid;
+	pid_t tgid;
 	atomic64_t total;
 	atomic64_t dropped;
 };
@@ -238,18 +241,19 @@ static void free_pair_table(void)
 // #  Processors Table
 
 // ---------------- pair table manipulation ----------------
-static void processors_table_inc(pid_t pid, u64 page, bool dropped)
+static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 {
 	struct processor_count *entry;
-	u32 bucket = pid & ((1u << pair_hash_bits) - 1);
+	u32 h32 = pair_hash_u64(pid, tgid);
+	u32 bucket = h32 & ((1u << pair_hash_bits) - 1);
 	unsigned int li = lock_index_for_bucket(bucket);
 
 	if (!bucket_locks)
 		return;
 
 	spin_lock(&bucket_locks[li]);
-	hash_for_each_possible(processors_table, entry, node, pid) {
-		if (entry->pid == pid) {
+	hash_for_each_possible(processors_table, entry, node, h32) {
+		if (entry->pid == pid && entry->tgid == tgid) {
 			if (dropped)
 				atomic64_inc(&entry->dropped);
 			atomic64_inc(&entry->total);
@@ -265,6 +269,7 @@ static void processors_table_inc(pid_t pid, u64 page, bool dropped)
 	}
 
 	entry->pid = pid;
+	entry->tgid = tgid;
 	atomic64_set(&entry->total, 1);
 	atomic64_set(&entry->dropped, dropped);
 
@@ -296,7 +301,7 @@ static void push_event_to_percpu(u64 id, char type)
 		atomic64_inc(&stat_dropped);
 		atomic64_inc(&stat_events);
 
-		processors_table_inc(current->pid, id, 1);
+		processors_table_inc(current->pid, current->tgid, id, 1);
 		return;
 	}
 
@@ -305,6 +310,9 @@ static void push_event_to_percpu(u64 id, char type)
 
 	rb->buf[rb->head].ts_ns = ktime_get_ns();
 	rb->buf[rb->head].pid = current->pid;
+	rb->buf[rb->head].tgid = current->tgid;
+	memcpy(rb->buf[rb->head].comm, current->comm, TASK_COMM_LEN);
+
 	rb->buf[rb->head].id = id;
 	rb->buf[rb->head].type = type;
 	rb->head = (rb->head + 1) % buf_len;
@@ -313,7 +321,7 @@ static void push_event_to_percpu(u64 id, char type)
 	if (rb->count < buf_len)
 		rb->count++;
 
-	processors_table_inc(current->pid, id, 0);
+	processors_table_inc(current->pid, current->tgid, id, 0);
 
 	spin_unlock_irqrestore(&rb->lock, flags);
 

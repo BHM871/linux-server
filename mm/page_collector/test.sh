@@ -30,7 +30,7 @@ function save_logs() {
 	done
 
 	if [[ "$log_name" != "normal.log" ]]; then
-		python ./converter.py
+		python ./events_converter.py
 		mv "page_events.csv" "$DATADIR/events_$1.csv"
 	fi
 
@@ -68,10 +68,12 @@ function run_test() {
 
 	echo "[...] Starting benchmarks at $(date '+%Hh %Mm %Ss %Nns')"
 	timer=$(run_bench "$PROCFILE")
-	save_logs "$data_name" "$timer"
 
 	echo "[...] Removing $MODULE"
 	sudo rmmod "$MODULE"
+
+	echo "[...] Saving logs"
+	save_logs "$data_name" "$timer"
 
 	echo "[✓] $executionº test finished"
 

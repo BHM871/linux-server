@@ -270,8 +270,8 @@ static int proc_show(struct seq_file *m, void *v)
 	struct processor_count *entry;
 	unsigned bkt;
 	hash_for_each(processors_table, bkt, entry, node) {
-		seq_printf(m, "pid=%i total=%lld dropped=%lld\n",
-			   (unsigned int)entry->pid,
+		seq_printf(m, "pid=%i tgid=%i total=%lld dropped=%lld\n",
+			   (unsigned int)entry->pid, (unsigned int)entry->tgid,
 			   (long long)atomic64_read(&entry->total),
 			   (long long)atomic64_read(&entry->dropped));
 	}
