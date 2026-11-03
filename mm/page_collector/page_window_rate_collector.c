@@ -3,6 +3,7 @@
 // Target: x86_64 kernels (tested conceptually for linux 6.12.x).
 
 #define MODULE_NAME "page_window_rate"
+#define MODULE_EVENTS "/tmp/page_window_rate_events.bin"
 
 #include "page_collector.h"
 
@@ -34,14 +35,10 @@ MODULE_PARM_DESC(pair_hash_bits,
 module_param(max_report, uint, 0644);
 MODULE_PARM_DESC(max_report, "Max entries printed via /proc");
 
-enum window_state { WINDOW_OFF = 0, WINDOW_ON = 1, WINDOW_LOCK = 2 };
+enum window_state { WINDOW_OFF = 0, WINDOW_ON = 1 };
 static enum window_state cur_state = WINDOW_OFF;
 
 // workqueue for processing window end
-static struct file *events_file;
-static loff_t events_file_pos;
-static struct workqueue_struct *pw_wq;
-static struct work_struct process_work;
 static unsigned int process_interval_ms = 100;
 
 // timer
@@ -56,81 +53,6 @@ static atomic64_t handle_fault_hits = ATOMIC_INIT(0);
 #define PROC_NAME "page_window_rate_pairs"
 static struct proc_dir_entry *proc_entry = NULL;
 
-// #  Events
-
-// ---------------- push event ----------------
-static void push_event_if_possible(u64 id, char type)
-{
-	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
-
-	if (rb->head == 0 && rb->count != 0) {
-		cur_state = WINDOW_LOCK;
-
-		// schedule processing on workqueue
-		if (pw_wq)
-			queue_work(pw_wq, &process_work);
-	}
-
-	push_event_to_percpu(id, type);
-}
-
-// ---------------- file helper ----------------
-
-static int open_events_file(void)
-{
-	events_file = filp_open("/tmp/page_window_rate_events.bin",
-				O_WRONLY | O_CREAT | O_TRUNC, 0644);
-
-	if (IS_ERR(events_file)) {
-		int ret = PTR_ERR(events_file);
-		events_file = NULL;
-		return ret;
-	}
-
-	events_file_pos = 0;
-	return 0;
-}
-
-static void write_events(struct work_struct *work)
-{
-	if (!events_file) {
-		return;
-	}
-
-	int cpu;
-	unsigned int max_items = buf_len;
-	struct page_event *snap = NULL;
-
-	// allocate snapshot buffer once (per CPU we reuse)
-	snap = kmalloc_array(max_items, sizeof(struct page_event), GFP_KERNEL);
-	if (!snap) {
-		pr_warn("%s: cannot allocate snapshot buffer\n", MODULE_NAME);
-		return;
-	}
-
-	for_each_possible_cpu(cpu) {
-		unsigned int cnt = snapshot_percpu_buffer(cpu, snap, max_items);
-		if (cnt == 0)
-			continue;
-
-		kernel_write(events_file, snap, cnt * sizeof(struct page_event),
-			     &events_file_pos);
-	}
-
-	kfree(snap);
-
-	cur_state = WINDOW_ON;
-}
-
-static void close_events_file(void)
-{
-	if (events_file) {
-		filp_close(events_file, NULL);
-		events_file = NULL;
-	}
-}
-
-/* ------------- UNUSED EXCERPT START -------------
 // ---------------- processing: consume snapshots and compute pairs ----------------
 static void process_window_work(struct work_struct *work)
 {
@@ -162,6 +84,8 @@ static void process_window_work(struct work_struct *work)
 				pair_table_inc(id_i, id_j);
 			}
 		}
+
+		write_events(snap, cnt);
 	}
 
 	kfree(snap);
@@ -174,7 +98,7 @@ static void schedule_processing(unsigned long delay_ms)
 {
 	if (!pw_wq)
 		return;
-	queue_work(pw_wq, &process_work);
+	queue_delayed_work(pw_wq, &process_work_events, delay_ms);
 }
 
 static void process_work_fn(struct work_struct *work)
@@ -183,7 +107,6 @@ static void process_work_fn(struct work_struct *work)
 	// reschedule periodic processing (keeps sampling up-to-date)
 	schedule_processing(process_interval_ms);
 }
-// ------------- UNUSED EXCERPT END -------------*/
 
 // ---------------- kprobe handler (hot path) ----------------
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
@@ -211,7 +134,7 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 		id = (u64)(address & PAGE_MASK);
 	}
 
-	push_event_if_possible(id, type);
+	push_event_to_percpu(id, type);
 #endif
 	return 0;
 }
@@ -219,9 +142,6 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 // ---------------- timer callback (switch windows) ----------------
 static enum hrtimer_restart window_timer_cb(struct hrtimer *timer)
 {
-	if (cur_state == WINDOW_LOCK)
-		return HRTIMER_RESTART;
-
 	// toggle state
 	if (cur_state == WINDOW_OFF) {
 		// turn ON: start on timer and set state
@@ -320,8 +240,8 @@ static int __init pw_init(void)
 		pr_err("%s: failed to open events file\n", MODULE_NAME);
 		ret = -ENOMEM;
 	}
-	INIT_WORK(&process_work, write_events);
-	// schedule_processing(process_interval_ms);
+	INIT_DELAYED_WORK(&process_work_events, process_work_fn);
+	schedule_processing(process_interval_ms);
 
 	// create proc
 	proc_entry = proc_create(PROC_NAME, 0444, NULL, &proc_fops);
@@ -365,7 +285,7 @@ static void __exit pw_exit(void)
 
 	// cancel work and destroy wq
 	if (pw_wq) {
-		cancel_work_sync(&process_work);
+		cancel_delayed_work_sync(&process_work_events);
 		destroy_workqueue(pw_wq);
 		pw_wq = NULL;
 		close_events_file();

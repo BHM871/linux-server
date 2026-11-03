@@ -4,6 +4,7 @@
 // Tested conceptually for x86_64 kernels (target: 6.12.x).
 
 #define MODULE_NAME "page_rate"
+#define MODULE_EVENTS "/tmp/page_rate_events.bin"
 
 #include "page_collector.h"
 

@@ -31,6 +31,10 @@ static unsigned int max_report = 20000;
 #error "MODULE_NAME must be define before include"
 #endif // !MODULE_NAME
 
+#ifndef MODULE_EVENTS
+#error "MODULE_EVENTS must be define before include"
+#endif // !MODULE_EVENTS
+
 struct page_event {
 	u64 ts_ns;
 	pid_t pid;
@@ -93,6 +97,12 @@ static atomic64_t stat_pairs = ATOMIC64_INIT(0);
 
 // pair heap
 static struct heap_pair_entry heap;
+
+// workqueue for processing window end
+static struct file *events_file;
+static loff_t events_file_pos;
+static struct workqueue_struct *pw_wq;
+static struct delayed_work process_work_events;
 
 // #  Hashs
 
@@ -357,6 +367,44 @@ static unsigned int snapshot_percpu_buffer(int cpu, struct page_event *out_buf,
 
 	spin_unlock_irqrestore(&rb->lock, flags);
 	return cnt;
+}
+
+// ---------------- file helper ----------------
+
+static int open_events_file(void)
+{
+	events_file =
+		filp_open(MODULE_EVENTS, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+	if (IS_ERR(events_file)) {
+		int ret = PTR_ERR(events_file);
+		events_file = NULL;
+		return ret;
+	}
+
+	events_file_pos = 0;
+	return 0;
+}
+
+static void write_events(struct page_event *snap, int cnt)
+{
+	if (!events_file) {
+		return;
+	}
+
+	if (cnt == 0)
+		return;
+
+	kernel_write(events_file, snap, cnt * sizeof(struct page_event),
+		     &events_file_pos);
+}
+
+static void close_events_file(void)
+{
+	if (events_file) {
+		filp_close(events_file, NULL);
+		events_file = NULL;
+	}
 }
 
 // #  Handles
