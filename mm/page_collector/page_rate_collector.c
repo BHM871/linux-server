@@ -164,6 +164,7 @@ static void __exit pw_exit(void)
 	// free hashtable
 	free_pair_table();
 	free_processors_table();
+	free_segments_table();
 
 	// free buffers
 	free_percpu_buffers();

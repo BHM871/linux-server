@@ -28,11 +28,11 @@ module_param(buf_len, uint, 0644);
 MODULE_PARM_DESC(buf_len,
 		 "Per-CPU buffer length (max events per window). Default 16k");
 
-module_param(segments_percentil, uint, 0644);
+module_param(segments_percentil, ushort, 0644);
 MODULE_PARM_DESC(segments_percentil,
 		 "Percentil used to create segments. Default p70");
 
-module_param(max_segment_size, uint, 0644);
+module_param(max_segment_size, ushort, 0644);
 MODULE_PARM_DESC(max_segment_size,
 		 "Max of pages that a segment can have. Default 100");
 
@@ -102,6 +102,9 @@ static enum hrtimer_restart window_timer_cb(struct hrtimer *timer)
 		cur_state = WINDOW_OFF;
 		pr_debug("page_window_rate: window OFF\n");
 
+		if (pw_wq)
+			queue_work(pw_wq, &process_work_segments);
+
 		// rearm for OFF duration
 		hrtimer_forward_now(timer, kt_off);
 		return HRTIMER_RESTART;
@@ -115,8 +118,9 @@ static int proc_show(struct seq_file *m, void *v)
 
 	seq_printf(
 		m,
-		"# params: on_ms=%u off_ms=%u sample_rate=%u buf_len=%u hash_bits=%u max_report=%u\n",
-		on_ms, off_ms, sample_rate, buf_len, hash_bits, max_report);
+		"# params: on_ms=%u off_ms=%u sample_rate=%u segments_percentil=%u max_segment_size=%u  buf_len=%u hash_bits=%u max_report=%u\n",
+		on_ms, off_ms, sample_rate, segments_percentil,
+		max_segment_size, buf_len, hash_bits, max_report);
 
 	seq_printf(
 		m,
@@ -132,13 +136,37 @@ static int proc_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&folio_mark_hits),
 		   (long long)atomic64_read(&handle_fault_hits));
 
-	struct processor_count *entry;
+	seq_printf(m, "\n");
+
+	struct segment_pages *entrys;
 	unsigned bkt;
-	hash_for_each(processors_table, bkt, entry, node) {
+	hash_for_each(segments_table, bkt, entrys, node) {
+		seq_printf(m,
+			   "pid=%i id=%llu pages=", (unsigned int)entrys->pid,
+			   (unsigned long long)entrys->id);
+
+		int idx = (entrys->head - entrys->count + max_segment_size) %
+			  max_segment_size;
+		for (int i = 0; i < max_segment_size && i < entrys->count;
+		     i++) {
+			seq_printf(
+				m, "%llu;",
+				(unsigned long long)entrys
+					->pages[(idx + i) % max_segment_size]);
+		}
+
+		seq_printf(m, "\n");
+	}
+
+	seq_printf(m, "\n");
+
+	struct processor_count *entryp;
+	hash_for_each(processors_table, bkt, entryp, node) {
 		seq_printf(m, "pid=%i tgid=%i total=%lld dropped=%lld\n",
-			   (unsigned int)entry->pid, (unsigned int)entry->tgid,
-			   (long long)atomic64_read(&entry->total),
-			   (long long)atomic64_read(&entry->dropped));
+			   (unsigned int)entryp->pid,
+			   (unsigned int)entryp->tgid,
+			   (long long)atomic64_read(&entryp->total),
+			   (long long)atomic64_read(&entryp->dropped));
 	}
 
 	return 0;
@@ -149,8 +177,9 @@ static int __init pw_init(void)
 {
 	int ret;
 
-	pr_info("%s: init (on_ms=%u off_ms=%u sample_rate=%u buf_len=%u hash_bits=%u)\n",
-		MODULE_NAME, on_ms, off_ms, sample_rate, buf_len, hash_bits);
+	pr_info("%s: init (on_ms=%u off_ms=%u sample_rate=%u segments_percentil=%u max_segment_size=%u buf_len=%u hash_bits=%u max_report=%u)\n",
+		MODULE_NAME, on_ms, off_ms, sample_rate, segments_percentil,
+		max_segment_size, buf_len, hash_bits, max_report);
 
 	if (buf_len < 128)
 		buf_len = 128;
@@ -160,6 +189,7 @@ static int __init pw_init(void)
 	// init hash table with chosen bits
 	hash_init(pair_table);
 	hash_init(processors_table);
+	hash_init(segments_table);
 
 	// allocate bucket locks using number of buckets
 	init_bucket_locks(1u << hash_bits);
@@ -185,6 +215,7 @@ static int __init pw_init(void)
 		ret = -ENOMEM;
 	}
 	INIT_DELAYED_WORK(&process_work_events, process_events_fn);
+	INIT_WORK(&process_work_segments, process_segments);
 	schedule_processing(process_interval_ms);
 
 	// create proc
@@ -230,6 +261,7 @@ static void __exit pw_exit(void)
 	// cancel work and destroy wq
 	if (pw_wq) {
 		cancel_delayed_work_sync(&process_work_events);
+		cancel_work_sync(&process_work_segments);
 		destroy_workqueue(pw_wq);
 		pw_wq = NULL;
 		close_events_file();
@@ -245,6 +277,7 @@ static void __exit pw_exit(void)
 	// free tables
 	free_pair_table();
 	free_processors_table();
+	free_segments_table();
 
 	// free per-cpu buffers
 	free_percpu_buffers();

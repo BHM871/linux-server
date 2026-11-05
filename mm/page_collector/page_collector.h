@@ -23,6 +23,8 @@ static unsigned long delta_ns = 10000000UL; // 10 ms default
 static unsigned int sample_rate = 2; // keep every Nth event (1 = no sampling)
 static unsigned int buf_len = 1024; // per-cpu buffer size (events)
 static unsigned int hash_bits = 12; // hashtable size 2^bits
+static unsigned short segments_percentil = 70;
+static unsigned short max_segment_size = 100;
 static unsigned int max_report = 20000;
 
 // ----------------- constants & helpers -----------------
@@ -78,6 +80,15 @@ struct processor_count {
 	atomic64_t dropped;
 };
 
+struct segment_pages {
+	struct hlist_node node;
+	pid_t pid;
+	u64 id;
+	u64 *pages;
+	unsigned int head;
+	unsigned int count;
+};
+
 struct heap_pair_entry {
 	struct pair_entry *items;
 	int size;
@@ -89,6 +100,7 @@ static struct recent_buf __percpu *pcpu_bufs = NULL;
 
 static DEFINE_HASHTABLE(pair_table, 12); // initialize later with param
 static DEFINE_HASHTABLE(processors_table, 12);
+static DEFINE_HASHTABLE(segments_table, 12);
 
 static spinlock_t *bucket_locks = NULL; // array of locks for hash buckets
 static unsigned int bucket_lock_count = 256; // will be tuned
@@ -617,6 +629,37 @@ static void process_events_fn(struct work_struct *work)
 	process_events(work);
 	// reschedule periodic processing (keeps sampling up-to-date)
 	schedule_processing(process_interval_ms);
+}
+
+// #  Segments
+
+static u64 calculate_percentil(int percentil, u64 elements)
+{
+	u64 per = (elements * percentil) / 100;
+	return clamp(per, 0, elements - 1);
+}
+
+static void process_segments(struct work_struct *work)
+{
+	struct pair_entry *entry;
+	int per, size;
+	u64 limit;
+
+	fill_heap_pair_entry();
+
+	size = min(heap.size, heap.capacity);
+	per = calculate_percentil(segments_percentil, size);
+
+	limit = (unsigned long long)atomic64_read(&heap.items[size - 1].count);
+	limit = calculate_percentil(100 - segments_percentil, limit);
+
+	for (int i = size - 1; i >= per; i--) {
+		entry = &heap.items[i];
+		if (atomic64_read(&entry->count) < limit)
+			break;
+
+		segments_table_inc(entry->key.pid, entry->key.a, entry->key.b);
+	}
 }
 
 // #  Handles
