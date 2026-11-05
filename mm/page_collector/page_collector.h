@@ -35,13 +35,15 @@ static unsigned int max_report = 20000;
 #error "MODULE_EVENTS must be define before include"
 #endif // !MODULE_EVENTS
 
+enum event_type { ACCESSED = 'F', FAULT = 'H' };
+
 struct page_event {
 	u64 ts_ns;
 	pid_t pid;
 	pid_t tgid;
 	// either (ID_IS_PFN_FLAG | pfn) or (vaddr >> PAGE_SHIFT)
 	u64 id;
-	char type;
+	enum event_type type;
 	char comm[TASK_COMM_LEN];
 };
 
@@ -378,10 +380,70 @@ static void free_processors_table(void)
 	}
 }
 
+// ---------------- segments table manipulation ----------------
+static void segments_table_inc(pid_t pid, u64 id, u64 page)
+{
+	struct segment_pages *entry;
+	u32 h32 = pair_hash_u64(pid, id);
+	u32 bucket = h32 & ((1u << hash_bits) - 1);
+	unsigned int li = lock_index_for_bucket(bucket);
+
+	if (!bucket_locks)
+		return;
+
+	spin_lock(&bucket_locks[li]);
+	hash_for_each_possible(segments_table, entry, node, h32) {
+		if (entry->pid == pid && entry->id == id) {
+			entry->pages[entry->head] = page;
+			entry->head = (entry->head + 1) % max_segment_size;
+			if (entry->count < max_segment_size)
+				entry->count++;
+
+			spin_unlock(&bucket_locks[li]);
+			return;
+		}
+	}
+
+	// not found -> create
+	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	if (!entry) {
+		spin_unlock(&bucket_locks[li]);
+		return;
+	}
+
+	entry->pages = kmalloc_array(max_segment_size, sizeof(u64), GFP_KERNEL);
+	if (!entry->pages) {
+		kfree(entry);
+		spin_unlock(&bucket_locks[li]);
+		return;
+	}
+
+	entry->pid = pid;
+	entry->id = id;
+	entry->pages[0] = page;
+	entry->head = 1;
+	entry->count = 1;
+
+	hash_add(segments_table, &entry->node, h32);
+
+	spin_unlock(&bucket_locks[li]);
+}
+
+static void free_segments_table(void)
+{
+	struct segment_pages *entry;
+	unsigned bkt;
+	hash_for_each(segments_table, bkt, entry, node) {
+		hash_del(&entry->node);
+		kfree(entry->pages);
+		kfree(entry);
+	}
+}
+
 // #  Events
 
 // ---------------- push event (hot path) ----------------
-static void push_event_to_percpu(u64 id, char type)
+static void push_event_to_percpu(u64 id, enum event_type type)
 {
 	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
 	unsigned long flags;
@@ -515,16 +577,18 @@ static void process_events(struct work_struct *work)
 		u64 ts_j;
 		u64 id_j;
 		for (i = 0; i < cnt; ++i) {
+			if (snap[i].type != FAULT)
+				continue;
+
 			ts_i = snap[i].ts_ns;
 			id_i = snap[i].id;
 			for (j = i + 1; j < cnt; ++j) {
 				ts_j = snap[j].ts_ns;
-				if (ts_j < ts_i)
+				if (snap[i].pid != snap[j].pid ||
+				    snap[j].type != FAULT || ts_j < ts_i)
 					continue;
 				if (ts_j - ts_i > delta_ns)
 					break;
-				if (snap[i].pid != snap[j].pid)
-					continue;
 				id_j = snap[j].id;
 
 				// increment pair id_i -> id_j

@@ -65,7 +65,7 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	char type = '-';
 	if (p == &kp_folio_mark) {
 		atomic64_inc(&folio_mark_hits);
-		type = 'F';
+		type = ACCESSED;
 
 		struct folio *folio = (struct folio *)regs->di;
 		if (folio) {
@@ -74,7 +74,7 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 		}
 	} else if (p == &kp_handle_fault) {
 		atomic64_inc(&handle_fault_hits);
-		type = 'H';
+		type = FAULT;
 
 		unsigned long address = (unsigned long)regs->si;
 		id = (u64)(address & PAGE_MASK);

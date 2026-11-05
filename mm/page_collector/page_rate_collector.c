@@ -37,16 +37,16 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 #ifdef CONFIG_X86_64
 	u64 id = 0;
-	char type = '-';
+	enum event_type type = '-';
 	if (p == &kp_folio_mark) {
-		type = 'F';
+		type = ACCESSED;
 		struct folio *folio = (struct folio *)regs->di;
 		if (folio) {
 			unsigned long pfn = folio_pfn(folio);
 			id = ID_IS_PFN_FLAG | (u64)pfn;
 		}
 	} else if (p == &kp_handle_fault) {
-		type = 'H';
+		type = FAULT;
 		unsigned long address = (unsigned long)regs->si;
 		id = (u64)(address & PAGE_MASK);
 	}
