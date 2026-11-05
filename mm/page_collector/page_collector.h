@@ -22,7 +22,7 @@ static unsigned int off_ms = 90; // idle window in ms
 static unsigned long delta_ns = 10000000UL; // 10 ms default
 static unsigned int sample_rate = 2; // keep every Nth event (1 = no sampling)
 static unsigned int buf_len = 1024; // per-cpu buffer size (events)
-static unsigned int pair_hash_bits = 12; // hashtable size 2^bits
+static unsigned int hash_bits = 12; // hashtable size 2^bits
 static unsigned int max_report = 20000;
 
 // ----------------- constants & helpers -----------------
@@ -57,6 +57,7 @@ struct recent_buf {
 
 // pair hashtable
 struct pair_key {
+	pid_t pid;
 	u64 a;
 	u64 b;
 };
@@ -103,6 +104,83 @@ static struct file *events_file;
 static loff_t events_file_pos;
 static struct workqueue_struct *pw_wq;
 static struct delayed_work process_work_events;
+static struct work_struct process_work_segments;
+static unsigned int process_interval_ms = 100;
+
+// # Heap Tree
+
+static void heap_swap(struct heap_pair_entry *heap, int a, int b)
+{
+	struct pair_entry tmp = heap->items[a];
+	heap->items[a] = heap->items[b];
+	heap->items[b] = tmp;
+}
+
+static void heap_shift_up(struct heap_pair_entry *heap, int index)
+{
+	while (index > 0) {
+		int parent = (index - 1) / 2;
+
+		if (atomic64_read(&heap->items[parent].count) <=
+		    atomic64_read(&heap->items[index].count))
+			break;
+
+		heap_swap(heap, parent, index);
+		index = parent;
+	}
+}
+
+static void heap_shift_down(struct heap_pair_entry *heap, int index)
+{
+	while (index <= heap->capacity) {
+		int left = index * 2 + 1;
+		int rigth = index * 2 + 2;
+		int smallest = index;
+
+		if (left < heap->size &&
+		    atomic64_read(&heap->items[left].count) <
+			    atomic64_read(&heap->items[smallest].count))
+			smallest = left;
+
+		if (rigth < heap->size &&
+		    atomic64_read(&heap->items[rigth].count) <
+			    atomic64_read(&heap->items[smallest].count))
+			smallest = rigth;
+
+		if (smallest == index)
+			break;
+
+		heap_swap(heap, smallest, index);
+		index = smallest;
+	}
+}
+
+static void heap_push(struct heap_pair_entry *heap, struct pair_entry entry)
+{
+	if (heap->size < heap->capacity) {
+		heap->items[heap->size] = entry;
+		heap_shift_up(heap, heap->size);
+		heap->size++;
+
+		return;
+	}
+
+	if (atomic64_read(&entry.count) <= atomic64_read(&heap->items[0].count))
+		return;
+
+	heap->items[0] = entry;
+	heap_shift_down(heap, 0);
+}
+
+static void fill_heap_pair_entry(void)
+{
+	struct pair_entry *entry;
+	unsigned int bkt;
+
+	hash_for_each(pair_table, bkt, entry, node) {
+		heap_push(&heap, *entry);
+	}
+}
 
 // #  Hashs
 
@@ -200,14 +278,14 @@ static void free_bucket_locks(void)
 	}
 }
 
-// #  Pair Table
+// #  Hashtables
 
 // ---------------- pair table manipulation ----------------
-static void pair_table_inc(u64 a, u64 b)
+static void pair_table_inc(pid_t pid, u64 a, u64 b)
 {
 	struct pair_entry *entry;
-	u32 h32 = pair_hash_u64(a, b);
-	u32 bucket = h32 & ((1u << pair_hash_bits) - 1);
+	u32 h32 = pair_hash_u64(pid, a);
+	u32 bucket = h32 & ((1u << hash_bits) - 1);
 	unsigned int li = lock_index_for_bucket(bucket);
 
 	if (!bucket_locks)
@@ -215,7 +293,8 @@ static void pair_table_inc(u64 a, u64 b)
 
 	spin_lock(&bucket_locks[li]);
 	hash_for_each_possible(pair_table, entry, node, h32) {
-		if (entry->key.a == a && entry->key.b == b) {
+		if (entry->key.pid == pid && entry->key.a == a &&
+		    entry->key.b == b) {
 			atomic64_inc(&entry->count);
 			spin_unlock(&bucket_locks[li]);
 			atomic64_inc(&stat_pairs);
@@ -227,8 +306,10 @@ static void pair_table_inc(u64 a, u64 b)
 	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
 	if (!entry) {
 		spin_unlock(&bucket_locks[li]);
+		return;
 	}
 
+	entry->key.pid = pid;
 	entry->key.a = a;
 	entry->key.b = b;
 	atomic64_set(&entry->count, 1);
@@ -248,14 +329,12 @@ static void free_pair_table(void)
 	}
 }
 
-// #  Processors Table
-
-// ---------------- pair table manipulation ----------------
+// ---------------- processer table manipulation ----------------
 static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 {
 	struct processor_count *entry;
 	u32 h32 = pair_hash_u64(pid, tgid);
-	u32 bucket = h32 & ((1u << pair_hash_bits) - 1);
+	u32 bucket = h32 & ((1u << hash_bits) - 1);
 	unsigned int li = lock_index_for_bucket(bucket);
 
 	if (!bucket_locks)
@@ -276,6 +355,7 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
 	if (!entry) {
 		spin_unlock(&bucket_locks[li]);
+		return;
 	}
 
 	entry->pid = pid;
@@ -283,7 +363,7 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 	atomic64_set(&entry->total, 1);
 	atomic64_set(&entry->dropped, dropped);
 
-	hash_add(processors_table, &entry->node, pid);
+	hash_add(processors_table, &entry->node, h32);
 
 	spin_unlock(&bucket_locks[li]);
 }
@@ -326,7 +406,6 @@ static void push_event_to_percpu(u64 id, char type)
 	rb->buf[rb->head].id = id;
 	rb->buf[rb->head].type = type;
 	rb->head = (rb->head + 1) % buf_len;
-	rb->count++;
 
 	if (rb->count < buf_len)
 		rb->count++;
@@ -407,6 +486,75 @@ static void close_events_file(void)
 	}
 }
 
+// ---------------- processing: consume snapshots and compute pairs ----------------
+static void process_events(struct work_struct *work)
+{
+	int cpu;
+	unsigned int max_items = buf_len;
+	struct page_event *snap = NULL;
+
+	// allocate snapshot buffer once (per CPU we reuse)
+	snap = kmalloc_array(max_items, sizeof(struct page_event), GFP_KERNEL);
+	if (!snap) {
+		pr_warn("%s: cannot allocate snapshot buffer\n", MODULE_NAME);
+		return;
+	}
+
+	// For each CPU, copy its buffer and then for each pair (i<j) within the snapshot,
+	// if timestamps within window (they should already be), increment pair.
+	unsigned int i, j;
+	for_each_possible_cpu(cpu) {
+		unsigned int cnt = snapshot_percpu_buffer(cpu, snap, max_items);
+		if (cnt == 0)
+			continue;
+
+		// nested loops: for each i, j>i, increment pair if within on_ms (they are from same window)
+		// We assume these events are all from the same window, so we pair all i<j
+		u64 ts_i;
+		u64 id_i;
+		u64 ts_j;
+		u64 id_j;
+		for (i = 0; i < cnt; ++i) {
+			ts_i = snap[i].ts_ns;
+			id_i = snap[i].id;
+			for (j = i + 1; j < cnt; ++j) {
+				ts_j = snap[j].ts_ns;
+				if (ts_j < ts_i)
+					continue;
+				if (ts_j - ts_i > delta_ns)
+					break;
+				if (snap[i].pid != snap[j].pid)
+					continue;
+				id_j = snap[j].id;
+
+				// increment pair id_i -> id_j
+				pair_table_inc(snap[i].pid, id_i, id_j);
+			}
+		}
+
+		write_events(snap, cnt);
+	}
+
+	kfree(snap);
+
+	pr_debug("%s: processed window (pairs total ~ %lld)\n", MODULE_NAME,
+		 (long long)atomic64_read(&stat_pairs));
+}
+
+static void schedule_processing(unsigned long delay_ms)
+{
+	if (!pw_wq)
+		return;
+	queue_delayed_work(pw_wq, &process_work_events, delay_ms);
+}
+
+static void process_events_fn(struct work_struct *work)
+{
+	process_events(work);
+	// reschedule periodic processing (keeps sampling up-to-date)
+	schedule_processing(process_interval_ms);
+}
+
 // #  Handles
 
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs);
@@ -445,80 +593,6 @@ static void unregister_my_kprobes(void)
 }
 
 // # /proc
-
-// ---------------- ordenate -----------------
-static void heap_swap(struct heap_pair_entry *heap, int a, int b)
-{
-	struct pair_entry tmp = heap->items[a];
-	heap->items[a] = heap->items[b];
-	heap->items[b] = tmp;
-}
-
-static void heap_shift_up(struct heap_pair_entry *heap, int index)
-{
-	while (index > 0) {
-		int parent = (index - 1) / 2;
-
-		if (atomic64_read(&heap->items[parent].count) <=
-		    atomic64_read(&heap->items[index].count))
-			break;
-
-		heap_swap(heap, parent, index);
-		index = parent;
-	}
-}
-
-static void heap_shift_down(struct heap_pair_entry *heap, int index)
-{
-	while (index <= heap->capacity) {
-		int left = index * 2 + 1;
-		int rigth = index * 2 + 2;
-		int smallest = index;
-
-		if (left < heap->size &&
-		    atomic64_read(&heap->items[left].count) <
-			    atomic64_read(&heap->items[smallest].count))
-			smallest = left;
-
-		if (rigth < heap->size &&
-		    atomic64_read(&heap->items[rigth].count) <
-			    atomic64_read(&heap->items[smallest].count))
-			smallest = rigth;
-
-		if (smallest == index)
-			break;
-
-		heap_swap(heap, smallest, index);
-		index = smallest;
-	}
-}
-
-static void heap_push(struct heap_pair_entry *heap, struct pair_entry entry)
-{
-	if (heap->size < heap->capacity) {
-		heap->items[heap->size] = entry;
-		heap_shift_up(heap, heap->size);
-		heap->size++;
-
-		return;
-	}
-
-	if (atomic64_read(&entry.count) <= atomic64_read(&heap->items[0].count))
-		return;
-
-	heap->items[0] = entry;
-	heap_shift_down(heap, 0);
-}
-
-static void fill_heap_pair_entry(void)
-{
-	struct pair_entry *entry;
-	unsigned int bkt;
-
-	hash_for_each(pair_table, bkt, entry, node) {
-		heap_push(&heap, *entry);
-	}
-}
 
 // ---------------- proc read ----------------
 static int proc_show(struct seq_file *m, void *v);

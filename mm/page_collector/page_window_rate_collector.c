@@ -28,18 +28,19 @@ module_param(buf_len, uint, 0644);
 MODULE_PARM_DESC(buf_len,
 		 "Per-CPU buffer length (max events per window). Default 16k");
 
-module_param(pair_hash_bits, uint, 0644);
-MODULE_PARM_DESC(pair_hash_bits,
-		 "Hash bits for pair table (2^bits buckets). Default 12");
+module_param(segments_percentil, uint, 0644);
+MODULE_PARM_DESC(segments_percentil,
+		 "Percentil used to create segments. Default p70");
+
+module_param(max_segment_size, uint, 0644);
+MODULE_PARM_DESC(max_segment_size,
+		 "Max of pages that a segment can have. Default 100");
 
 module_param(max_report, uint, 0644);
 MODULE_PARM_DESC(max_report, "Max entries printed via /proc");
 
 enum window_state { WINDOW_OFF = 0, WINDOW_ON = 1 };
 static enum window_state cur_state = WINDOW_OFF;
-
-// workqueue for processing window end
-static unsigned int process_interval_ms = 100;
 
 // timer
 static struct hrtimer window_timer;
@@ -52,61 +53,6 @@ static atomic64_t handle_fault_hits = ATOMIC_INIT(0);
 // /proc
 #define PROC_NAME "page_window_rate_pairs"
 static struct proc_dir_entry *proc_entry = NULL;
-
-// ---------------- processing: consume snapshots and compute pairs ----------------
-static void process_window_work(struct work_struct *work)
-{
-	int cpu;
-	unsigned int max_items = buf_len;
-	struct page_event *snap = NULL;
-
-	// allocate snapshot buffer once (per CPU we reuse)
-	snap = kmalloc_array(max_items, sizeof(struct page_event), GFP_KERNEL);
-	if (!snap) {
-		pr_warn("%s: cannot allocate snapshot buffer\n", MODULE_NAME);
-		return;
-	}
-
-	// For each CPU, copy its buffer and then for each pair (i<j) within the snapshot,
-	// if timestamps within window (they should already be), increment pair.
-	unsigned int i, j;
-	for_each_possible_cpu(cpu) {
-		unsigned int cnt = snapshot_percpu_buffer(cpu, snap, max_items);
-		if (cnt == 0)
-			continue;
-
-		// nested loops: for each i, j>i, increment pair if within on_ms (they are from same window)
-		// We assume these events are all from the same window, so we pair all i<j
-		for (i = 0; i < cnt; ++i) {
-			u64 id_i = snap[i].id;
-			for (j = i + 1; j < cnt; ++j) {
-				u64 id_j = snap[j].id;
-				pair_table_inc(id_i, id_j);
-			}
-		}
-
-		write_events(snap, cnt);
-	}
-
-	kfree(snap);
-
-	pr_debug("%s: processed window (pairs total ~ %lld)\n", MODULE_NAME,
-		 (long long)atomic64_read(&stat_pairs));
-}
-
-static void schedule_processing(unsigned long delay_ms)
-{
-	if (!pw_wq)
-		return;
-	queue_delayed_work(pw_wq, &process_work_events, delay_ms);
-}
-
-static void process_work_fn(struct work_struct *work)
-{
-	process_window_work(work);
-	// reschedule periodic processing (keeps sampling up-to-date)
-	schedule_processing(process_interval_ms);
-}
 
 // ---------------- kprobe handler (hot path) ----------------
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
@@ -169,9 +115,8 @@ static int proc_show(struct seq_file *m, void *v)
 
 	seq_printf(
 		m,
-		"# params: on_ms=%u off_ms=%u sample_rate=%u buf_len=%u pair_hash_bits=%u max_report=%u\n",
-		on_ms, off_ms, sample_rate, buf_len, pair_hash_bits,
-		max_report);
+		"# params: on_ms=%u off_ms=%u sample_rate=%u buf_len=%u hash_bits=%u max_report=%u\n",
+		on_ms, off_ms, sample_rate, buf_len, hash_bits, max_report);
 
 	seq_printf(
 		m,
@@ -205,8 +150,7 @@ static int __init pw_init(void)
 	int ret;
 
 	pr_info("%s: init (on_ms=%u off_ms=%u sample_rate=%u buf_len=%u hash_bits=%u)\n",
-		MODULE_NAME, on_ms, off_ms, sample_rate, buf_len,
-		pair_hash_bits);
+		MODULE_NAME, on_ms, off_ms, sample_rate, buf_len, hash_bits);
 
 	if (buf_len < 128)
 		buf_len = 128;
@@ -218,7 +162,7 @@ static int __init pw_init(void)
 	hash_init(processors_table);
 
 	// allocate bucket locks using number of buckets
-	init_bucket_locks(1u << pair_hash_bits);
+	init_bucket_locks(1u << hash_bits);
 
 	// allocate per-cpu buffers
 	ret = alloc_percpu_buffers(buf_len);
@@ -240,7 +184,7 @@ static int __init pw_init(void)
 		pr_err("%s: failed to open events file\n", MODULE_NAME);
 		ret = -ENOMEM;
 	}
-	INIT_DELAYED_WORK(&process_work_events, process_work_fn);
+	INIT_DELAYED_WORK(&process_work_events, process_events_fn);
 	schedule_processing(process_interval_ms);
 
 	// create proc
@@ -298,7 +242,7 @@ static void __exit pw_exit(void)
 		kfree(heap.items);
 	}
 
-	// free pair table
+	// free tables
 	free_pair_table();
 	free_processors_table();
 

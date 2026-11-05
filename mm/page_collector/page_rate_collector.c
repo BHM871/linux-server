@@ -25,77 +25,12 @@ module_param(sample_rate, uint, 0644);
 MODULE_PARM_DESC(sample_rate,
 		 "Sampling rate: keep 1 every N events (default 1)");
 
-module_param(pair_hash_bits, uint, 0644);
-MODULE_PARM_DESC(pair_hash_bits, "Hash bits for pair table (2^bits buckets)");
-
 module_param(max_report, uint, 0644);
 MODULE_PARM_DESC(max_report, "Max number of pair entries to report from /proc");
-
-/* workqueue to process events in batch */
-static struct workqueue_struct *pm_wq;
-static struct delayed_work process_work;
-// periodic worker interval fallback
-static unsigned int process_interval_ms = 50;
 
 // proc
 #define PROC_NAME "page_rate_pairs"
 static struct proc_dir_entry *proc_entry = NULL;
-
-// ----------------- worker: process snapshots and form pairs -----------------
-static void process_all_buffers(struct work_struct *work);
-
-static void schedule_processing(unsigned long delay_ms)
-{
-	if (!pm_wq)
-		return;
-	queue_delayed_work(pm_wq, &process_work, msecs_to_jiffies(delay_ms));
-}
-
-static void process_work_fn(struct work_struct *work)
-{
-	process_all_buffers(work);
-	// reschedule periodic processing (keeps sampling up-to-date)
-	schedule_processing(process_interval_ms);
-}
-
-static void process_all_buffers(struct work_struct *work)
-{
-	int cpu;
-	struct page_event *snapshot = NULL;
-	unsigned int max_items = buf_len;
-	unsigned int i, j;
-
-	snapshot =
-		kmalloc_array(max_items, sizeof(struct page_event), GFP_KERNEL);
-	if (!snapshot)
-		return;
-
-	// for each CPU, snapshot buffer and find pairs within delta_ns
-	for_each_possible_cpu(cpu) {
-		unsigned int cnt =
-			snapshot_percpu_buffer(cpu, snapshot, max_items);
-		if (cnt == 0)
-			continue;
-
-		// For each event i, look ahead j (i < j) until time delta exceeded
-		for (i = 0; i < cnt; ++i) {
-			u64 ts_i = snapshot[i].ts_ns;
-			u64 id_i = snapshot[i].id;
-			for (j = i + 1; j < cnt; ++j) {
-				u64 ts_j = snapshot[j].ts_ns;
-				if (ts_j < ts_i)
-					continue;
-				if (ts_j - ts_i > delta_ns)
-					break;
-				u64 id_j = snapshot[j].id;
-				// increment pair id_i -> id_j
-				pair_table_inc(id_i, id_j);
-			}
-		}
-	}
-
-	kfree(snapshot);
-}
 
 // ----------------- kprobe handlers -----------------
 static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
@@ -130,7 +65,7 @@ static int proc_show(struct seq_file *m, void *v)
 	seq_printf(
 		m,
 		"# params: delta_ns=%ld sample_rate=%u buf_len=%u pair_hash_bits=%u max_report=%u\n",
-		delta_ns, sample_rate, buf_len, pair_hash_bits, max_report);
+		delta_ns, sample_rate, buf_len, hash_bits, max_report);
 
 	seq_printf(m,
 		   "# stats: total_events=%lld total_pairs=%lld dropped=%lld\n",
@@ -154,10 +89,10 @@ static int proc_show(struct seq_file *m, void *v)
 static int __init pw_init(void)
 {
 	int ret;
-	unsigned int buckets = 1u << pair_hash_bits;
+	unsigned int buckets = 1u << hash_bits;
 
 	pr_info("%s: init (delta_ns=%lu buf_len=%u sample=%u hash_bits=%u)\n",
-		MODULE_NAME, delta_ns, buf_len, sample_rate, pair_hash_bits);
+		MODULE_NAME, delta_ns, buf_len, sample_rate, hash_bits);
 
 	// sanity checks and limits
 	if (buf_len < 16)
@@ -178,13 +113,13 @@ static int __init pw_init(void)
 	}
 
 	// create workqueue
-	pm_wq = create_singlethread_workqueue("page_rate_wq");
-	if (!pm_wq) {
+	pw_wq = create_singlethread_workqueue("page_rate_wq");
+	if (!pw_wq) {
 		pr_err("page_rate: failed to create workqueue\n");
 		free_percpu_buffers();
 		return -ENOMEM;
 	}
-	INIT_DELAYED_WORK(&process_work, process_work_fn);
+	INIT_DELAYED_WORK(&process_work_events, process_events_fn);
 	schedule_processing(process_interval_ms);
 
 	// create proc entry
@@ -213,10 +148,10 @@ static void __exit pw_exit(void)
 	unregister_my_kprobes();
 
 	// cancel work and destroy wq
-	if (pm_wq) {
-		cancel_delayed_work_sync(&process_work);
-		destroy_workqueue(pm_wq);
-		pm_wq = NULL;
+	if (pw_wq) {
+		cancel_delayed_work_sync(&process_work_events);
+		destroy_workqueue(pw_wq);
+		pw_wq = NULL;
 	}
 
 	// remove proc
@@ -228,6 +163,7 @@ static void __exit pw_exit(void)
 
 	// free hashtable
 	free_pair_table();
+	free_processors_table();
 
 	// free buffers
 	free_percpu_buffers();
