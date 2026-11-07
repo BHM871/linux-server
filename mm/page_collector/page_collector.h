@@ -62,6 +62,7 @@ struct recent_buf {
 // pair hashtable
 struct pair_key {
 	pid_t pid;
+	pid_t tgid;
 	u64 a;
 	u64 b;
 };
@@ -83,6 +84,7 @@ struct processor_count {
 struct segment_pages {
 	struct hlist_node node;
 	pid_t pid;
+	pid_t tgid;
 	u64 id;
 	u64 *pages;
 	unsigned int head;
@@ -295,10 +297,10 @@ static void free_bucket_locks(void)
 // #  Hashtables
 
 // ---------------- pair table manipulation ----------------
-static void pair_table_inc(pid_t pid, u64 a, u64 b)
+static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 {
 	struct pair_entry *entry;
-	u32 h32 = pair_hash_u64(pid, a);
+	u32 h32 = pair_hash_u64(tgid, a);
 	u32 bucket = h32 & ((1u << hash_bits) - 1);
 	unsigned int li = lock_index_for_bucket(bucket);
 
@@ -307,7 +309,7 @@ static void pair_table_inc(pid_t pid, u64 a, u64 b)
 
 	spin_lock(&bucket_locks[li]);
 	hash_for_each_possible(pair_table, entry, node, h32) {
-		if (entry->key.pid == pid && entry->key.a == a &&
+		if (entry->key.tgid == tgid && entry->key.a == a &&
 		    entry->key.b == b) {
 			atomic64_inc(&entry->count);
 			spin_unlock(&bucket_locks[li]);
@@ -324,6 +326,7 @@ static void pair_table_inc(pid_t pid, u64 a, u64 b)
 	}
 
 	entry->key.pid = pid;
+	entry->key.tgid = tgid;
 	entry->key.a = a;
 	entry->key.b = b;
 	atomic64_set(&entry->count, 1);
@@ -393,10 +396,10 @@ static void free_processors_table(void)
 }
 
 // ---------------- segments table manipulation ----------------
-static void segments_table_inc(pid_t pid, u64 id, u64 page)
+static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 {
 	struct segment_pages *entry;
-	u32 h32 = pair_hash_u64(pid, id);
+	u32 h32 = pair_hash_u64(tgid, id);
 	u32 bucket = h32 & ((1u << hash_bits) - 1);
 	unsigned int li = lock_index_for_bucket(bucket);
 
@@ -405,7 +408,7 @@ static void segments_table_inc(pid_t pid, u64 id, u64 page)
 
 	spin_lock(&bucket_locks[li]);
 	hash_for_each_possible(segments_table, entry, node, h32) {
-		if (entry->pid == pid && entry->id == id) {
+		if (entry->tgid == tgid && entry->id == id) {
 			entry->pages[entry->head] = page;
 			entry->head = (entry->head + 1) % max_segment_size;
 			if (entry->count < max_segment_size)
@@ -431,6 +434,7 @@ static void segments_table_inc(pid_t pid, u64 id, u64 page)
 	}
 
 	entry->pid = pid;
+	entry->tgid = tgid;
 	entry->id = id;
 	entry->pages[0] = page;
 	entry->head = 1;
@@ -596,7 +600,7 @@ static void process_events(struct work_struct *work)
 			id_i = snap[i].id;
 			for (j = i + 1; j < cnt; ++j) {
 				ts_j = snap[j].ts_ns;
-				if (snap[i].pid != snap[j].pid ||
+				if (snap[i].tgid != snap[j].tgid ||
 				    snap[j].type != FAULT || ts_j < ts_i)
 					continue;
 				if (ts_j - ts_i > delta_ns)
@@ -604,7 +608,8 @@ static void process_events(struct work_struct *work)
 				id_j = snap[j].id;
 
 				// increment pair id_i -> id_j
-				pair_table_inc(snap[i].pid, id_i, id_j);
+				pair_table_inc(snap[i].pid, snap[i].tgid, id_i,
+					       id_j);
 			}
 		}
 
@@ -658,7 +663,8 @@ static void process_segments(struct work_struct *work)
 		if (atomic64_read(&entry->count) < limit)
 			break;
 
-		segments_table_inc(entry->key.pid, entry->key.a, entry->key.b);
+		segments_table_inc(entry->key.pid, entry->key.tgid,
+				   entry->key.a, entry->key.b);
 	}
 }
 

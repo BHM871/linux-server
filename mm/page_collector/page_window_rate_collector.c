@@ -77,7 +77,7 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 		type = FAULT;
 
 		unsigned long address = (unsigned long)regs->si;
-		id = (u64)(address & PAGE_MASK);
+		id = (u64)address;
 	}
 
 	push_event_to_percpu(id, type);
@@ -141,8 +141,9 @@ static int proc_show(struct seq_file *m, void *v)
 	struct segment_pages *entrys;
 	unsigned bkt;
 	hash_for_each(segments_table, bkt, entrys, node) {
-		seq_printf(m,
-			   "pid=%i id=%llu pages=", (unsigned int)entrys->pid,
+		seq_printf(m, "pid=%i tgid=%i id=%llu pages=",
+			   (unsigned int)entrys->pid,
+			   (unsigned int)entrys->tgid,
 			   (unsigned long long)entrys->id);
 
 		int idx = (entrys->head - entrys->count + max_segment_size) %
