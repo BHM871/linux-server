@@ -224,12 +224,12 @@ static int __init pw_init(void)
 	if (!proc_entry) {
 		pr_warn("%s: failed to create /proc/%s\n", MODULE_NAME,
 			PROC_NAME);
-	} else {
-		heap.items = kmalloc_array(
-			max_report, sizeof(struct pair_entry), GFP_KERNEL);
-		heap.size = 0;
-		heap.capacity = max_report;
 	}
+
+	heap.items = kmalloc_array(max_report, sizeof(struct pair_entry),
+				   GFP_KERNEL);
+	heap.size = 0;
+	heap.capacity = max_report;
 
 	register_my_kprobes();
 

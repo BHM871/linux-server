@@ -651,6 +651,8 @@ static void process_segments(struct work_struct *work)
 	u64 limit;
 
 	fill_heap_pair_entry();
+	if (heap.size <= 0)
+		return;
 
 	size = min(heap.size, heap.capacity);
 	per = calculate_percentil(segments_percentil, size);
