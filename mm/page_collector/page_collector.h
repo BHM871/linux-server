@@ -112,6 +112,9 @@ static atomic64_t stat_events = ATOMIC64_INIT(0);
 static atomic64_t stat_dropped = ATOMIC64_INIT(0);
 static atomic64_t stat_pairs = ATOMIC64_INIT(0);
 
+static atomic64_t stat_segments = ATOMIC64_INIT(0);
+static atomic64_t stat_segments_loaded = ATOMIC64_INIT(0);
+
 // pair heap
 static struct heap_pair_entry heap;
 
@@ -439,6 +442,7 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 	entry->pages[0] = page;
 	entry->head = 1;
 	entry->count = 1;
+	atomic64_inc(&stat_segments);
 
 	hash_add(segments_table, &entry->node, h32);
 
@@ -638,6 +642,55 @@ static void process_events_fn(struct work_struct *work)
 
 // #  Segments
 
+static void prefetch_segment(struct segment_pages *segment)
+{
+	struct pid *pid;
+	struct task_struct *task;
+	u8 value;
+	unsigned int idx, i, out;
+
+	pid = find_get_pid(segment->pid);
+	if (!pid)
+		return;
+
+	task = get_pid_task(pid, PIDTYPE_PID);
+	put_pid(pid);
+
+	if (!task)
+		return;
+
+	idx = (segment->head - segment->count + max_segment_size) %
+	      max_segment_size;
+
+	for (i = 0; i < segment->count; i++) {
+		unsigned long addr =
+			segment->pages[(idx + i) % max_segment_size];
+
+		if ((addr & ID_IS_PFN_FLAG))
+			continue;
+
+		out = access_process_vm(task, addr, &value, sizeof(value), 0);
+		if (out <= 0) {
+			pr_debug(
+				"%s: prefetch failed pid=%d tgid=%d addr=%lx\n",
+				MODULE_NAME, segment->pid, segment->tgid, addr);
+			continue;
+		}
+	}
+
+	put_task_struct(task);
+	atomic64_inc(&stat_segments_loaded);
+}
+
+static void prefetch_segments(void)
+{
+	struct segment_pages *entry;
+	unsigned int bucket;
+
+	hash_for_each(segments_table, bucket, entry, node)
+		prefetch_segment(entry);
+}
+
 static u64 calculate_percentil(int percentil, u64 elements)
 {
 	u64 per = (elements * percentil) / 100;
@@ -668,6 +721,8 @@ static void process_segments(struct work_struct *work)
 		segments_table_inc(entry->key.pid, entry->key.tgid,
 				   entry->key.a, entry->key.b);
 	}
+
+	prefetch_segments();
 }
 
 // #  Handles

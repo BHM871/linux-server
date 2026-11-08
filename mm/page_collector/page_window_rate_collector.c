@@ -140,6 +140,9 @@ static int proc_show(struct seq_file *m, void *v)
 
 	struct segment_pages *entrys;
 	unsigned bkt;
+	seq_printf(m, "# segments segments_count=%lld segments_loaded=%lld\n",
+		   (long long)atomic64_read(&stat_segments),
+		   (long long)atomic64_read(&stat_segments_loaded));
 	hash_for_each(segments_table, bkt, entrys, node) {
 		seq_printf(m, "pid=%i tgid=%i id=%llu pages=",
 			   (unsigned int)entrys->pid,
@@ -162,6 +165,7 @@ static int proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "\n");
 
 	struct processor_count *entryp;
+	seq_printf(m, "# process");
 	hash_for_each(processors_table, bkt, entryp, node) {
 		seq_printf(m, "pid=%i tgid=%i total=%lld dropped=%lld\n",
 			   (unsigned int)entryp->pid,
