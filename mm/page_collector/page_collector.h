@@ -1,4 +1,6 @@
 
+#include <linux/pid.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -45,7 +47,7 @@ struct page_event {
 	pid_t tgid;
 	// either (ID_IS_PFN_FLAG | pfn) or (vaddr >> PAGE_SHIFT)
 	u64 id;
-	enum event_type type;
+	char type;
 	char comm[TASK_COMM_LEN];
 };
 
@@ -83,6 +85,7 @@ struct processor_count {
 
 struct segment_pages {
 	struct hlist_node node;
+	bool loaded;
 	pid_t pid;
 	pid_t tgid;
 	u64 id;
@@ -124,7 +127,10 @@ static loff_t events_file_pos;
 static struct workqueue_struct *pw_wq;
 static struct delayed_work process_work_events;
 static struct work_struct process_work_segments;
-static unsigned int process_interval_ms = 100;
+static unsigned int process_interval_ms = 500;
+
+static void mark_segment_as(struct segment_pages *segment, bool loaded);
+static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded);
 
 // # Heap Tree
 
@@ -335,6 +341,8 @@ static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 	atomic64_set(&entry->count, 1);
 	hash_add(pair_table, &entry->node, h32);
 
+	mark_segment_by_id_as(tgid, a, false);
+
 	spin_unlock(&bucket_locks[li]);
 	atomic64_inc(&stat_pairs);
 }
@@ -399,6 +407,31 @@ static void free_processors_table(void)
 }
 
 // ---------------- segments table manipulation ----------------
+static void mark_segment_as(struct segment_pages *segment, bool loaded)
+{
+	if (segment->loaded == loaded)
+		return;
+
+	segment->loaded = loaded;
+	if (loaded)
+		atomic64_inc(&stat_segments_loaded);
+	else
+		atomic64_dec(&stat_segments_loaded);
+}
+
+static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded)
+{
+	struct segment_pages *entry;
+	u32 h32 = pair_hash_u64(tgid, id);
+
+	hash_for_each_possible(segments_table, entry, node, h32) {
+		if (entry->tgid == tgid && entry->id == id) {
+			mark_segment_as(entry, loaded);
+			return;
+		}
+	}
+}
+
 static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 {
 	struct segment_pages *entry;
@@ -442,6 +475,7 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 	entry->pages[0] = page;
 	entry->head = 1;
 	entry->count = 1;
+	entry->loaded = false;
 	atomic64_inc(&stat_segments);
 
 	hash_add(segments_table, &entry->node, h32);
@@ -604,8 +638,8 @@ static void process_events(struct work_struct *work)
 			id_i = snap[i].id;
 			for (j = i + 1; j < cnt; ++j) {
 				ts_j = snap[j].ts_ns;
-				if (snap[i].tgid != snap[j].tgid ||
-				    snap[j].type != FAULT || ts_j < ts_i)
+				if (snap[j].type != FAULT ||
+				    snap[i].tgid != snap[j].tgid || ts_j < ts_i)
 					continue;
 				if (ts_j - ts_i > delta_ns)
 					break;
@@ -644,6 +678,9 @@ static void process_events_fn(struct work_struct *work)
 
 static void prefetch_segment(struct segment_pages *segment)
 {
+	if (segment->loaded)
+		return;
+
 	struct pid *pid;
 	struct task_struct *task;
 	u8 value;
@@ -679,7 +716,7 @@ static void prefetch_segment(struct segment_pages *segment)
 	}
 
 	put_task_struct(task);
-	atomic64_inc(&stat_segments_loaded);
+	mark_segment_as(segment, true);
 }
 
 static void prefetch_segments(void)
@@ -711,7 +748,7 @@ static void process_segments(struct work_struct *work)
 	per = calculate_percentil(segments_percentil, size);
 
 	limit = (unsigned long long)atomic64_read(&heap.items[size - 1].count);
-	limit = calculate_percentil(100 - segments_percentil, limit);
+	limit = calculate_percentil(segments_percentil, limit);
 
 	for (int i = size - 1; i >= per; i--) {
 		entry = &heap.items[i];

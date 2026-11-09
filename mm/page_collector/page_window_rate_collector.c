@@ -118,7 +118,7 @@ static int proc_show(struct seq_file *m, void *v)
 
 	seq_printf(
 		m,
-		"# params: on_ms=%u off_ms=%u sample_rate=%u segments_percentil=%u max_segment_size=%u  buf_len=%u hash_bits=%u max_report=%u\n",
+		"# params: on_ms=%u off_ms=%u sample_rate=%u segments_percentil=%u max_segment_size=%u buf_len=%u hash_bits=%u max_report=%u\n",
 		on_ms, off_ms, sample_rate, segments_percentil,
 		max_segment_size, buf_len, hash_bits, max_report);
 
