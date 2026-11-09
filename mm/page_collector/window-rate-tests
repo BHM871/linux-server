@@ -1,0 +1,5 @@
+name=r2_w9000-1000,sample_rate=2,on_ms=9000,off_ms=1000
+name=r5_w9000-1000,sample_rate=5,on_ms=9000,off_ms=1000
+name=r10_w9000-1000,sample_rate=10,on_ms=9000,off_ms=1000
+name=r100_w9000-1000,sample_rate=100,on_ms=9000,off_ms=1000
+name=r500_w9000-1000,sample_rate=500,on_ms=9000,off_ms=1000
