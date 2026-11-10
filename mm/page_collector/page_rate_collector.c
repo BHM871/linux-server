@@ -58,7 +58,7 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 // ----------------- /proc read -----------------
 static int proc_show(struct seq_file *m, void *v)
 {
-	struct pair_entry entry;
+	struct heap_pair_entry entry;
 
 	fill_heap_pair_entry();
 
@@ -76,7 +76,7 @@ static int proc_show(struct seq_file *m, void *v)
 	for (int i = 0; i < max_report; i++) {
 		entry = heap.items[i];
 
-		long long cnt = (long long)atomic64_read(&entry.count);
+		long long cnt = entry.count;
 		seq_printf(m, "%lld,%llu,%llu\n", cnt,
 			   (unsigned long long)entry.key.a,
 			   (unsigned long long)entry.key.b);

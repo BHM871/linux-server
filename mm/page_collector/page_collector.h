@@ -1,4 +1,5 @@
 
+#include "linux/types.h"
 #include <linux/pid.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -52,7 +53,7 @@ struct page_event {
 	u64 ts_ns;
 	pid_t pid;
 	pid_t tgid;
-	// either (ID_IS_PFN_FLAG | pfn) or (vaddr >> PAGE_SHIFT)
+	// either (ID_IS_PFN_FLAG | pfn) or (vaddr | PAGE_MASK)
 	u64 id;
 	char type;
 	char comm[TASK_COMM_LEN];
@@ -102,7 +103,12 @@ struct segment_pages {
 };
 
 struct heap_pair_entry {
-	struct pair_entry *items;
+	struct pair_key key;
+	u64 count;
+};
+
+struct heap_pair {
+	struct heap_pair_entry *items;
 	int size;
 	int capacity;
 };
@@ -126,7 +132,7 @@ static atomic64_t stat_segments = ATOMIC64_INIT(0);
 static atomic64_t stat_segments_loaded = ATOMIC64_INIT(0);
 
 // pair heap
-static struct heap_pair_entry heap;
+static struct heap_pair heap;
 
 // workqueue for processing window end
 static struct file *events_file;
@@ -155,20 +161,19 @@ static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded);
 
 // # Heap Tree
 
-static void heap_swap(struct heap_pair_entry *heap, int a, int b)
+static void heap_swap(struct heap_pair *heap, int a, int b)
 {
-	struct pair_entry tmp = heap->items[a];
+	struct heap_pair_entry tmp = heap->items[a];
 	heap->items[a] = heap->items[b];
 	heap->items[b] = tmp;
 }
 
-static void heap_shift_up(struct heap_pair_entry *heap, int index)
+static void heap_shift_up(struct heap_pair *heap, int index)
 {
 	while (index > 0) {
 		int parent = (index - 1) / 2;
 
-		if (atomic64_read(&heap->items[parent].count) <=
-		    atomic64_read(&heap->items[index].count))
+		if (heap->items[parent].count <= heap->items[index].count)
 			break;
 
 		heap_swap(heap, parent, index);
@@ -176,7 +181,7 @@ static void heap_shift_up(struct heap_pair_entry *heap, int index)
 	}
 }
 
-static void heap_shift_down(struct heap_pair_entry *heap, int index)
+static void heap_shift_down(struct heap_pair *heap, int index)
 {
 	while (index <= heap->capacity) {
 		int left = index * 2 + 1;
@@ -184,13 +189,11 @@ static void heap_shift_down(struct heap_pair_entry *heap, int index)
 		int smallest = index;
 
 		if (left < heap->size &&
-		    atomic64_read(&heap->items[left].count) <
-			    atomic64_read(&heap->items[smallest].count))
+		    heap->items[left].count < heap->items[smallest].count)
 			smallest = left;
 
 		if (rigth < heap->size &&
-		    atomic64_read(&heap->items[rigth].count) <
-			    atomic64_read(&heap->items[smallest].count))
+		    heap->items[rigth].count < heap->items[smallest].count)
 			smallest = rigth;
 
 		if (smallest == index)
@@ -201,7 +204,7 @@ static void heap_shift_down(struct heap_pair_entry *heap, int index)
 	}
 }
 
-static void heap_push(struct heap_pair_entry *heap, struct pair_entry entry)
+static void heap_push(struct heap_pair *heap, struct heap_pair_entry entry)
 {
 	if (heap->size < heap->capacity) {
 		heap->items[heap->size] = entry;
@@ -211,7 +214,7 @@ static void heap_push(struct heap_pair_entry *heap, struct pair_entry entry)
 		return;
 	}
 
-	if (atomic64_read(&entry.count) <= atomic64_read(&heap->items[0].count))
+	if (entry.count <= heap->items[0].count)
 		return;
 
 	heap->items[0] = entry;
@@ -223,8 +226,14 @@ static void fill_heap_pair_entry(void)
 	struct pair_entry *entry;
 	unsigned int bkt;
 
+	heap.size = 0;
+
 	hash_for_each(pair_table, bkt, entry, node) {
-		heap_push(&heap, *entry);
+		struct heap_pair_entry item = {
+			.key = entry->key,
+			.count = atomic64_read(&entry->count),
+		};
+		heap_push(&heap, item);
 	}
 }
 
@@ -331,7 +340,7 @@ static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 {
 	struct pair_entry *entry;
 	u32 h32 = pair_hash_u64(tgid, a);
-	u32 bucket = h32 & ((1u << hash_bits) - 1);
+	u32 bucket = hash_min(h32, HASH_BITS(pair_table));
 	unsigned int li = lock_index_for_bucket(bucket);
 
 	if (!bucket_locks)
@@ -371,8 +380,10 @@ static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 static void free_pair_table(void)
 {
 	struct pair_entry *entry;
+	struct hlist_node *tmp;
 	unsigned bkt;
-	hash_for_each(pair_table, bkt, entry, node) {
+
+	hash_for_each_safe(pair_table, bkt, tmp, entry, node) {
 		hash_del(&entry->node);
 		kfree(entry);
 	}
@@ -386,7 +397,7 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 
 	struct processor_count *entry;
 	u32 h32 = pair_hash_u64(pid, tgid);
-	u32 bucket = h32 & ((1u << hash_bits) - 1);
+	u32 bucket = hash_min(h32, HASH_BITS(processors_table));
 	unsigned int li = lock_index_for_bucket(bucket);
 
 	if (!bucket_locks)
@@ -422,12 +433,10 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 
 static void free_processors_table(void)
 {
-	if (is_not_active(PROCESS_COUNT))
-		return;
-
 	struct processor_count *entry;
+	struct hlist_node *tmp;
 	unsigned bkt;
-	hash_for_each(processors_table, bkt, entry, node) {
+	hash_for_each_safe(processors_table, bkt, tmp, entry, node) {
 		hash_del(&entry->node);
 		kfree(entry);
 	}
@@ -440,7 +449,7 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 
 	struct segment_pages *entry;
 	u32 h32 = pair_hash_u64(tgid, id);
-	u32 bucket = h32 & ((1u << hash_bits) - 1);
+	u32 bucket = hash_min(h32, HASH_BITS(segments_table));
 	unsigned int li = lock_index_for_bucket(bucket);
 
 	if (!bucket_locks)
@@ -489,12 +498,10 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 
 static void free_segments_table(void)
 {
-	if (is_not_active(SEGMENT_COUNT))
-		return;
-
 	struct segment_pages *entry;
+	struct hlist_node *tmp;
 	unsigned bkt;
-	hash_for_each(segments_table, bkt, entry, node) {
+	hash_for_each_safe(segments_table, bkt, tmp, entry, node) {
 		hash_del(&entry->node);
 		kfree(entry->pages);
 		kfree(entry);
@@ -510,7 +517,8 @@ static void push_event_to_percpu(u64 id, enum event_type type)
 	unsigned long flags;
 
 	// simple sampling based on total events (not perfect but ok)
-	if ((atomic64_read(&stat_events) % sample_rate) != 0) {
+	if (sample_rate > 0 &&
+	    (atomic64_read(&stat_events) % sample_rate) != 0) {
 		atomic64_inc(&stat_dropped);
 		atomic64_inc(&stat_events);
 
@@ -560,11 +568,18 @@ static unsigned int snapshot_percpu_buffer(int cpu, struct page_event *out_buf,
 	// oldest idx:
 	idx = (rb->head - rb->count + buf_len) % buf_len;
 	for (i = 0; i < cmax; ++i) {
-		struct page_event p = rb->buf[(idx + i) % buf_len];
-		if (!p.id)
+		idx = (idx + 1) % buf_len;
+		struct page_event p = rb->buf[idx];
+
+		if (!p.pid || !p.id)
 			continue;
 
 		out_buf[cnt++] = p;
+
+		// invalidate event
+		rb->buf[idx].pid = 0;
+		rb->buf[idx].id = 0;
+		rb->count--;
 	}
 
 	spin_unlock_irqrestore(&rb->lock, flags);
@@ -705,13 +720,17 @@ static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded)
 
 	struct segment_pages *entry;
 	u32 h32 = pair_hash_u64(tgid, id);
+	u32 bucket = hash_min(h32, HASH_BITS(segments_table));
+	unsigned int li = lock_index_for_bucket(bucket);
 
+	spin_lock(&bucket_locks[li]);
 	hash_for_each_possible(segments_table, entry, node, h32) {
 		if (entry->tgid == tgid && entry->id == id) {
 			mark_segment_as(entry, loaded);
 			return;
 		}
 	}
+	spin_unlock(&bucket_locks[li]);
 }
 
 static void prefetch_segment(struct segment_pages *segment)
@@ -741,8 +760,8 @@ static void prefetch_segment(struct segment_pages *segment)
 	      max_segment_size;
 
 	for (i = 0; i < segment->count; i++) {
-		unsigned long addr =
-			segment->pages[(idx + i) % max_segment_size];
+		idx = (idx + 1) % max_segment_size;
+		unsigned long long addr = segment->pages[idx];
 
 		if ((addr & ID_IS_PFN_FLAG))
 			continue;
@@ -750,7 +769,7 @@ static void prefetch_segment(struct segment_pages *segment)
 		out = access_process_vm(task, addr, &value, sizeof(value), 0);
 		if (out <= 0) {
 			pr_debug(
-				"%s: prefetch failed pid=%d tgid=%d addr=%lx\n",
+				"%s: prefetch failed pid=%d tgid=%d addr=%llx\n",
 				MODULE_NAME, segment->pid, segment->tgid, addr);
 		}
 	}
@@ -767,8 +786,12 @@ static void prefetch_segments(void)
 	struct segment_pages *entry;
 	unsigned int bucket;
 
-	hash_for_each(segments_table, bucket, entry, node)
+	hash_for_each(segments_table, bucket, entry, node) {
+		unsigned int li = lock_index_for_bucket(bucket);
+		spin_lock(&bucket_locks[li]);
 		prefetch_segment(entry);
+		spin_unlock(&bucket_locks[li]);
+	}
 }
 
 static u64 calculate_percentil(int percentil, u64 elements)
@@ -782,7 +805,7 @@ static void process_segments(struct work_struct *work)
 	if (is_not_active(SEGMENT_COUNT))
 		return;
 
-	struct pair_entry *entry;
+	struct heap_pair_entry *entry;
 	int per, size;
 	u64 limit;
 
@@ -793,12 +816,12 @@ static void process_segments(struct work_struct *work)
 	size = min(heap.size, heap.capacity);
 	per = calculate_percentil(segments_percentil, size);
 
-	limit = (unsigned long long)atomic64_read(&heap.items[size - 1].count);
+	limit = heap.items[size - 1].count;
 	limit = calculate_percentil(segments_percentil, limit);
 
 	for (int i = size - 1; i >= per; i--) {
 		entry = &heap.items[i];
-		if (atomic64_read(&entry->count) < limit)
+		if (entry->count < limit)
 			break;
 
 		segments_table_inc(entry->key.pid, entry->key.tgid,
@@ -836,7 +859,7 @@ static int register_my_kprobes(void)
 		pr_warn("%s: failed to register kprobe handle_mm_fault: %d\n",
 			MODULE_NAME, ret);
 	}
-	return 0;
+	return ret;
 }
 
 static void unregister_my_kprobes(void)

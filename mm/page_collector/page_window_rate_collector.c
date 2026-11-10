@@ -24,7 +24,7 @@ module_param(sample_rate, uint, 0644);
 MODULE_PARM_DESC(sample_rate,
 		 "Sampling rate: keep 1 every N events (default 1)");
 
-module_param(buf_len, uint, 0644);
+module_param(buf_len, uint, 0444);
 MODULE_PARM_DESC(buf_len,
 		 "Per-CPU buffer length (max events per window). Default 16k");
 
@@ -32,14 +32,14 @@ module_param(segments_percentil, ushort, 0644);
 MODULE_PARM_DESC(segments_percentil,
 		 "Percentil used to create segments. Default p70");
 
-module_param(max_segment_size, ushort, 0644);
+module_param(max_segment_size, ushort, 0444);
 MODULE_PARM_DESC(max_segment_size,
 		 "Max of pages that a segment can have. Default 100");
 
-module_param(max_report, uint, 0644);
+module_param(max_report, uint, 0444);
 MODULE_PARM_DESC(max_report, "Max entries printed via /proc");
 
-module_param(active, ushort, 0644);
+module_param(active, ushort, 0444);
 MODULE_PARM_DESC(
 	active,
 	"Bit set to define if feature are active (segments_load, segments_count, process_count and events_file. Default (00001111)");
@@ -82,7 +82,7 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 		type = FAULT;
 
 		unsigned long address = (unsigned long)regs->si;
-		id = (u64)address;
+		id = (u64)(address & PAGE_MASK);
 	}
 
 	push_event_to_percpu(id, type);
@@ -155,6 +155,9 @@ static int proc_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&stat_segments),
 		   (long long)atomic64_read(&stat_segments_loaded));
 	hash_for_each(segments_table, bkt, entrys, node) {
+		unsigned int li = lock_index_for_bucket(bkt);
+		spin_lock(&bucket_locks[li]);
+
 		seq_printf(m, "pid=%i tgid=%i id=%llu pages=",
 			   (unsigned int)entrys->pid,
 			   (unsigned int)entrys->tgid,
@@ -171,6 +174,7 @@ static int proc_show(struct seq_file *m, void *v)
 		}
 
 		seq_printf(m, "\n");
+		spin_unlock(&bucket_locks[li]);
 	}
 
 	seq_printf(m, "\n");
@@ -178,11 +182,16 @@ static int proc_show(struct seq_file *m, void *v)
 	struct processor_count *entryp;
 	seq_printf(m, "# process\n");
 	hash_for_each(processors_table, bkt, entryp, node) {
+		unsigned int li = lock_index_for_bucket(bkt);
+		spin_lock(&bucket_locks[li]);
+
 		seq_printf(m, "pid=%i tgid=%i total=%lld dropped=%lld\n",
 			   (unsigned int)entryp->pid,
 			   (unsigned int)entryp->tgid,
 			   (long long)atomic64_read(&entryp->total),
 			   (long long)atomic64_read(&entryp->dropped));
+
+		spin_unlock(&bucket_locks[li]);
 	}
 
 	return 0;
@@ -222,12 +231,17 @@ static int __init pw_init(void)
 
 	// allocate bucket locks using number of buckets
 	init_bucket_locks(1u << hash_bits);
+	if (bucket_lock_count == 1) {
+		pr_err("%s: failed to alloc bucket locks\n", MODULE_NAME);
+		return -ENOMEM;
+	}
 
 	// allocate per-cpu buffers
 	ret = alloc_percpu_buffers(buf_len);
 	if (ret) {
 		pr_err("%s: failed to alloc per-cpu buffers: %d\n", MODULE_NAME,
 		       ret);
+		free_percpu_buffers();
 		free_bucket_locks();
 		return ret;
 	}
@@ -236,12 +250,13 @@ static int __init pw_init(void)
 	pw_wq = create_singlethread_workqueue("page_window_rate_wq");
 	if (!pw_wq) {
 		pr_err("%s: failed to create workqueue\n", MODULE_NAME);
-		ret = -ENOMEM;
 		free_percpu_buffers();
+		free_bucket_locks();
+		return -ENOMEM;
 	}
-	if (pw_wq && open_events_file()) {
+	if (open_events_file()) {
 		pr_err("%s: failed to open events file\n", MODULE_NAME);
-		ret = -ENOMEM;
+		return -ENOMEM;
 	}
 	INIT_DELAYED_WORK(&process_work_events, process_events_fn);
 	INIT_WORK(&process_work_segments, process_segments);
@@ -254,12 +269,20 @@ static int __init pw_init(void)
 			PROC_NAME);
 	}
 
-	heap.items = kmalloc_array(max_report, sizeof(struct pair_entry),
-				   GFP_KERNEL);
 	heap.size = 0;
 	heap.capacity = max_report;
+	heap.items = kmalloc_array(max_report, sizeof(struct pair_entry),
+				   GFP_KERNEL);
+	if (!heap.items) {
+		pr_err("%s: failed to create heap list\n", MODULE_NAME);
+		return -ENOMEM;
+	}
 
-	register_my_kprobes();
+	ret = register_my_kprobes();
+	if (ret) {
+		pr_err("%s: failed to registry kprobes\n", MODULE_NAME);
+		return -ENOMEM;
+	}
 
 	// init timers
 	kt_on = ms_to_ktime(on_ms);
