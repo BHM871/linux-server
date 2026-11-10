@@ -28,6 +28,7 @@ static unsigned int hash_bits = 12; // hashtable size 2^bits
 static unsigned short segments_percentil = 70;
 static unsigned short max_segment_size = 100;
 static unsigned int max_report = 20000;
+static unsigned short active = 15; // bit set to define features active
 
 // ----------------- constants & helpers -----------------
 #define ID_IS_PFN_FLAG (1ULL << 63)
@@ -39,6 +40,12 @@ static unsigned int max_report = 20000;
 #error "MODULE_EVENTS must be define before include"
 #endif // !MODULE_EVENTS
 
+enum features {
+	SEGMENT_LOAD = 8,
+	SEGMENT_COUNT = 4,
+	PROCESS_COUNT = 2,
+	EVENTS_FILE = 1
+};
 enum event_type { ACCESSED = 'F', FAULT = 'H' };
 
 struct page_event {
@@ -129,6 +136,20 @@ static struct delayed_work process_work_events;
 static struct work_struct process_work_segments;
 static unsigned int process_interval_ms = 500;
 
+// # Utils
+
+// ------------ features ------------
+static bool is_active(enum features feat)
+{
+	return active & feat;
+}
+
+static bool is_not_active(enum features feat)
+{
+	return !is_active(feat);
+}
+
+// ------------ segments ------------
 static void mark_segment_as(struct segment_pages *segment, bool loaded);
 static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded);
 
@@ -360,6 +381,9 @@ static void free_pair_table(void)
 // ---------------- processer table manipulation ----------------
 static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 {
+	if (is_not_active(PROCESS_COUNT))
+		return;
+
 	struct processor_count *entry;
 	u32 h32 = pair_hash_u64(pid, tgid);
 	u32 bucket = h32 & ((1u << hash_bits) - 1);
@@ -398,6 +422,9 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 
 static void free_processors_table(void)
 {
+	if (is_not_active(PROCESS_COUNT))
+		return;
+
 	struct processor_count *entry;
 	unsigned bkt;
 	hash_for_each(processors_table, bkt, entry, node) {
@@ -406,34 +433,11 @@ static void free_processors_table(void)
 	}
 }
 
-// ---------------- segments table manipulation ----------------
-static void mark_segment_as(struct segment_pages *segment, bool loaded)
-{
-	if (segment->loaded == loaded)
-		return;
-
-	segment->loaded = loaded;
-	if (loaded)
-		atomic64_inc(&stat_segments_loaded);
-	else
-		atomic64_dec(&stat_segments_loaded);
-}
-
-static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded)
-{
-	struct segment_pages *entry;
-	u32 h32 = pair_hash_u64(tgid, id);
-
-	hash_for_each_possible(segments_table, entry, node, h32) {
-		if (entry->tgid == tgid && entry->id == id) {
-			mark_segment_as(entry, loaded);
-			return;
-		}
-	}
-}
-
 static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 {
+	if (is_not_active(SEGMENT_COUNT))
+		return;
+
 	struct segment_pages *entry;
 	u32 h32 = pair_hash_u64(tgid, id);
 	u32 bucket = h32 & ((1u << hash_bits) - 1);
@@ -485,6 +489,9 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 
 static void free_segments_table(void)
 {
+	if (is_not_active(SEGMENT_COUNT))
+		return;
+
 	struct segment_pages *entry;
 	unsigned bkt;
 	hash_for_each(segments_table, bkt, entry, node) {
@@ -568,6 +575,9 @@ static unsigned int snapshot_percpu_buffer(int cpu, struct page_event *out_buf,
 
 static int open_events_file(void)
 {
+	if (is_not_active(EVENTS_FILE))
+		return -1;
+
 	events_file =
 		filp_open(MODULE_EVENTS, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
@@ -583,11 +593,7 @@ static int open_events_file(void)
 
 static void write_events(struct page_event *snap, int cnt)
 {
-	if (!events_file) {
-		return;
-	}
-
-	if (cnt == 0)
+	if (!events_file || cnt == 0)
 		return;
 
 	kernel_write(events_file, snap, cnt * sizeof(struct page_event),
@@ -676,8 +682,43 @@ static void process_events_fn(struct work_struct *work)
 
 // #  Segments
 
+// ---------------- segments table manipulation ----------------
+static void mark_segment_as(struct segment_pages *segment, bool loaded)
+{
+	if (is_not_active(SEGMENT_LOAD))
+		return;
+
+	if (segment->loaded == loaded)
+		return;
+
+	segment->loaded = loaded;
+	if (loaded)
+		atomic64_inc(&stat_segments_loaded);
+	else
+		atomic64_dec(&stat_segments_loaded);
+}
+
+static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded)
+{
+	if (is_not_active(SEGMENT_LOAD))
+		return;
+
+	struct segment_pages *entry;
+	u32 h32 = pair_hash_u64(tgid, id);
+
+	hash_for_each_possible(segments_table, entry, node, h32) {
+		if (entry->tgid == tgid && entry->id == id) {
+			mark_segment_as(entry, loaded);
+			return;
+		}
+	}
+}
+
 static void prefetch_segment(struct segment_pages *segment)
 {
+	if (is_not_active(SEGMENT_LOAD))
+		return;
+
 	if (segment->loaded)
 		return;
 
@@ -711,7 +752,6 @@ static void prefetch_segment(struct segment_pages *segment)
 			pr_debug(
 				"%s: prefetch failed pid=%d tgid=%d addr=%lx\n",
 				MODULE_NAME, segment->pid, segment->tgid, addr);
-			continue;
 		}
 	}
 
@@ -721,6 +761,9 @@ static void prefetch_segment(struct segment_pages *segment)
 
 static void prefetch_segments(void)
 {
+	if (is_not_active(SEGMENT_LOAD))
+		return;
+
 	struct segment_pages *entry;
 	unsigned int bucket;
 
@@ -736,6 +779,9 @@ static u64 calculate_percentil(int percentil, u64 elements)
 
 static void process_segments(struct work_struct *work)
 {
+	if (is_not_active(SEGMENT_COUNT))
+		return;
+
 	struct pair_entry *entry;
 	int per, size;
 	u64 limit;

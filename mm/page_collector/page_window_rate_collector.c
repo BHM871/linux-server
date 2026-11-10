@@ -39,6 +39,11 @@ MODULE_PARM_DESC(max_segment_size,
 module_param(max_report, uint, 0644);
 MODULE_PARM_DESC(max_report, "Max entries printed via /proc");
 
+module_param(active, ushort, 0644);
+MODULE_PARM_DESC(
+	active,
+	"Bit set to define if feature are active (segments_load, segments_count, process_count and events_file. Default (00001111)");
+
 enum window_state { WINDOW_OFF = 0, WINDOW_ON = 1 };
 static enum window_state cur_state = WINDOW_OFF;
 
@@ -124,6 +129,12 @@ static int proc_show(struct seq_file *m, void *v)
 
 	seq_printf(
 		m,
+		"# features SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_FILE=%d\n",
+		is_active(SEGMENT_LOAD), is_active(SEGMENT_COUNT),
+		is_active(PROCESS_COUNT), is_active(EVENTS_FILE));
+
+	seq_printf(
+		m,
 		"# stats events=%lld dropped=%lld pairs=%lld state=%d (0=off 1=on 2=lock)\n",
 		(long long)atomic64_read(&stat_events),
 		(long long)atomic64_read(&stat_dropped),
@@ -165,7 +176,7 @@ static int proc_show(struct seq_file *m, void *v)
 	seq_printf(m, "\n");
 
 	struct processor_count *entryp;
-	seq_printf(m, "# process");
+	seq_printf(m, "# process\n");
 	hash_for_each(processors_table, bkt, entryp, node) {
 		seq_printf(m, "pid=%i tgid=%i total=%lld dropped=%lld\n",
 			   (unsigned int)entryp->pid,
@@ -185,6 +196,15 @@ static int __init pw_init(void)
 	pr_info("%s: init (on_ms=%u off_ms=%u sample_rate=%u segments_percentil=%u max_segment_size=%u buf_len=%u hash_bits=%u max_report=%u)\n",
 		MODULE_NAME, on_ms, off_ms, sample_rate, segments_percentil,
 		max_segment_size, buf_len, hash_bits, max_report);
+	pr_info("%s: features actived (SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_FILE=%d)\n",
+		MODULE_NAME, is_active(SEGMENT_LOAD), is_active(SEGMENT_COUNT),
+		is_active(PROCESS_COUNT), is_active(EVENTS_FILE));
+
+	if (is_active(SEGMENT_LOAD) && is_not_active(SEGMENT_COUNT)) {
+		pr_info("%s: forcing SEGMENT_COUNT feature because SEGMENT_LOAD is enabled\n",
+			MODULE_NAME);
+		active |= SEGMENT_COUNT;
+	}
 
 	if (buf_len < 128)
 		buf_len = 128;
@@ -193,8 +213,12 @@ static int __init pw_init(void)
 
 	// init hash table with chosen bits
 	hash_init(pair_table);
-	hash_init(processors_table);
-	hash_init(segments_table);
+
+	if (is_active(PROCESS_COUNT))
+		hash_init(processors_table);
+
+	if (is_active(SEGMENT_COUNT))
+		hash_init(segments_table);
 
 	// allocate bucket locks using number of buckets
 	init_bucket_locks(1u << hash_bits);
