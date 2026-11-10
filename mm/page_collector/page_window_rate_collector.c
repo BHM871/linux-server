@@ -133,6 +133,10 @@ static int proc_show(struct seq_file *m, void *v)
 		is_active(SEGMENT_LOAD), is_active(SEGMENT_COUNT),
 		is_active(PROCESS_COUNT), is_active(EVENTS_FILE));
 
+	seq_printf(m, "# mem allocated_bytes=%llu allocated_objects=%llu\n",
+		   (unsigned long long)atomic_long_read(&allocated_bytes),
+		   (unsigned long long)atomic_long_read(&allocated_count));
+
 	seq_printf(
 		m,
 		"# stats events=%lld dropped=%lld pairs=%lld state=%d (0=off 1=on 2=lock)\n",
@@ -271,8 +275,8 @@ static int __init pw_init(void)
 
 	heap.size = 0;
 	heap.capacity = max_report;
-	heap.items = kmalloc_array(max_report, sizeof(struct pair_entry),
-				   GFP_KERNEL);
+	heap.items = (struct heap_pair_entry *)aallocation(
+		max_report, sizeof(struct heap_pair_entry));
 	if (!heap.items) {
 		pr_err("%s: failed to create heap list\n", MODULE_NAME);
 		return -ENOMEM;
@@ -303,6 +307,10 @@ static int __init pw_init(void)
 static void __exit pw_exit(void)
 {
 	pr_info("%s: unloading module\n", MODULE_NAME);
+	pr_info("%s: mem allocated_bytes=%llu allocated_objects=%llu\n",
+		MODULE_NAME,
+		(unsigned long long)atomic_long_read(&allocated_bytes),
+		(unsigned long long)atomic_long_read(&allocated_count));
 
 	// stop timer
 	hrtimer_cancel(&window_timer);
@@ -323,8 +331,9 @@ static void __exit pw_exit(void)
 	if (proc_entry) {
 		proc_remove(proc_entry);
 		proc_entry = NULL;
-		kfree(heap.items);
 	}
+
+	deallocation(heap.items);
 
 	// free tables
 	free_pair_table();
@@ -337,6 +346,10 @@ static void __exit pw_exit(void)
 	// free locks
 	free_bucket_locks();
 
+	pr_info("%s: mem freeded allocated_bytes=%llu allocated_objects=%llu\n",
+		MODULE_NAME,
+		(unsigned long long)atomic_long_read(&allocated_bytes),
+		(unsigned long long)atomic_long_read(&allocated_count));
 	pr_info("%s: module unloaded\n", MODULE_NAME);
 }
 

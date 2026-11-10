@@ -131,6 +131,9 @@ static atomic64_t stat_pairs = ATOMIC64_INIT(0);
 static atomic64_t stat_segments = ATOMIC64_INIT(0);
 static atomic64_t stat_segments_loaded = ATOMIC64_INIT(0);
 
+static atomic_long_t allocated_bytes = ATOMIC_LONG_INIT(0);
+static atomic_long_t allocated_count = ATOMIC_LONG_INIT(0);
+
 // pair heap
 static struct heap_pair heap;
 
@@ -143,6 +146,52 @@ static struct work_struct process_work_segments;
 static unsigned int process_interval_ms = 500;
 
 // # Utils
+
+// ------------ allocation  ------------
+struct allocation_header {
+	size_t size;
+};
+
+static void *tracked_alloc(size_t size, gfp_t flags)
+{
+	struct allocation_header *header;
+
+	header = kmalloc(sizeof(*header) + size, flags);
+	if (!header)
+		return NULL;
+
+	header->size = size;
+
+	atomic_long_add(size, &allocated_bytes);
+	atomic_long_inc(&allocated_count);
+
+	return header + 1;
+}
+
+static void *allocation(size_t size)
+{
+	return tracked_alloc(size, GFP_ATOMIC);
+}
+
+static void *aallocation(u64 count, size_t size)
+{
+	return tracked_alloc(count * size, GFP_KERNEL);
+}
+
+static void deallocation(void *ptr)
+{
+	struct allocation_header *header;
+
+	if (!ptr)
+		return;
+
+	header = (struct allocation_header *)ptr - 1;
+
+	atomic_long_sub(header->size, &allocated_bytes);
+	atomic_long_dec(&allocated_count);
+
+	kfree(header);
+}
 
 // ------------ features ------------
 static bool is_active(enum features feat)
@@ -358,7 +407,7 @@ static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 	}
 
 	// not found -> create
-	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	entry = (struct pair_entry *)allocation(sizeof(*entry));
 	if (!entry) {
 		spin_unlock(&bucket_locks[li]);
 		return;
@@ -385,7 +434,7 @@ static void free_pair_table(void)
 
 	hash_for_each_safe(pair_table, bkt, tmp, entry, node) {
 		hash_del(&entry->node);
-		kfree(entry);
+		deallocation(entry);
 	}
 }
 
@@ -415,7 +464,7 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 	}
 
 	// not found -> create
-	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	entry = (struct processor_count *)allocation(sizeof(*entry));
 	if (!entry) {
 		spin_unlock(&bucket_locks[li]);
 		return;
@@ -438,7 +487,7 @@ static void free_processors_table(void)
 	unsigned bkt;
 	hash_for_each_safe(processors_table, bkt, tmp, entry, node) {
 		hash_del(&entry->node);
-		kfree(entry);
+		deallocation(entry);
 	}
 }
 
@@ -469,15 +518,15 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 	}
 
 	// not found -> create
-	entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+	entry = (struct segment_pages *)allocation(sizeof(*entry));
 	if (!entry) {
 		spin_unlock(&bucket_locks[li]);
 		return;
 	}
 
-	entry->pages = kmalloc_array(max_segment_size, sizeof(u64), GFP_KERNEL);
+	entry->pages = (u64 *)aallocation(max_segment_size, sizeof(u64));
 	if (!entry->pages) {
-		kfree(entry);
+		deallocation(entry);
 		spin_unlock(&bucket_locks[li]);
 		return;
 	}
@@ -503,8 +552,8 @@ static void free_segments_table(void)
 	unsigned bkt;
 	hash_for_each_safe(segments_table, bkt, tmp, entry, node) {
 		hash_del(&entry->node);
-		kfree(entry->pages);
-		kfree(entry);
+		deallocation(entry->pages);
+		deallocation(entry);
 	}
 }
 
@@ -631,7 +680,8 @@ static void process_events(struct work_struct *work)
 	struct page_event *snap = NULL;
 
 	// allocate snapshot buffer once (per CPU we reuse)
-	snap = kmalloc_array(max_items, sizeof(struct page_event), GFP_KERNEL);
+	snap = (struct page_event *)aallocation(max_items,
+						sizeof(struct page_event));
 	if (!snap) {
 		pr_warn("%s: cannot allocate snapshot buffer\n", MODULE_NAME);
 		return;
@@ -675,7 +725,7 @@ static void process_events(struct work_struct *work)
 		write_events(snap, cnt);
 	}
 
-	kfree(snap);
+	deallocation(snap);
 
 	pr_debug("%s: processed window (pairs total ~ %lld)\n", MODULE_NAME,
 		 (long long)atomic64_read(&stat_pairs));
