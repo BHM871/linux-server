@@ -40,11 +40,21 @@ static unsigned short active = 15; // bit set to define features active
 #error "MODULE_EVENTS must be define before include"
 #endif // !MODULE_EVENTS
 
+enum init_errors {
+	ELOCKS = 1,
+	EBUFFERS = 2,
+	EMIN_HEAP = 4,
+	EQUEUE_WORK = 8,
+	EWORKERS = 16,
+	EKPROBES = 32,
+	EWINDOW = 64,
+};
+
 enum features {
-	SEGMENT_LOAD = 8,
-	SEGMENT_COUNT = 4,
+	EVENTS_FILE = 1,
 	PROCESS_COUNT = 2,
-	EVENTS_FILE = 1
+	SEGMENT_COUNT = 4,
+	SEGMENT_LOAD = 8,
 };
 
 enum event_type { ACCESSED = 'F', FAULT = 'H' };
@@ -657,8 +667,13 @@ static int open_events_file(void)
 
 static void write_events(struct page_event *snap, int cnt)
 {
-	if (!events_file || cnt == 0)
+	if (is_not_active(EVENTS_FILE) || cnt == 0)
 		return;
+
+	if (!events_file) {
+		if (open_events_file())
+			return;
+	}
 
 	kernel_write(events_file, snap, cnt * sizeof(struct page_event),
 		     &events_file_pos);
@@ -894,18 +909,20 @@ static struct kprobe kp_handle_fault = {
 	.pre_handler = kp_pre_handler,
 };
 
-static int register_my_kprobes(void)
+static int register_my_kprobes(int *errors)
 {
 	int ret;
 	ret = register_kprobe(&kp_folio_mark);
 	if (ret) {
 		pr_warn("%s: failed to register kprobe folio_mark_accessed: %d\n",
 			MODULE_NAME, ret);
+		*errors |= EKPROBES;
 	}
-	ret = register_kprobe(&kp_handle_fault);
+	ret |= register_kprobe(&kp_handle_fault);
 	if (ret) {
 		pr_warn("%s: failed to register kprobe handle_mm_fault: %d\n",
 			MODULE_NAME, ret);
+		*errors |= EKPROBES;
 	}
 	return ret;
 }
