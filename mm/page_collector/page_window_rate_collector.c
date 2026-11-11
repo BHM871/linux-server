@@ -1311,7 +1311,7 @@ static int start_workers(int *errors)
 	if (!process_work_events.wq || !process_work_segments.func) {
 		pr_err("%s: failed create workers\n", MODULE_NAME);
 		*errors |= EWORKERS;
-		return -1;
+		return 1;
 	}
 
 	return 0;
@@ -1353,7 +1353,7 @@ static int init_window_timer(int *errors)
 
 	if (!window_timer.function) {
 		*errors |= EWINDOW;
-		return -1;
+		return 1;
 	}
 
 	if (on_ms <= 0 && off_ms <= 0) {
@@ -1425,7 +1425,7 @@ static int handle_errors(int errors, int *returns)
 		if (returns[i])
 			return returns[i];
 
-	return -1;
+	return 1;
 }
 
 // ---------------- init / exit ----------------
