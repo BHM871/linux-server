@@ -110,9 +110,11 @@ enum init_errors {
 
 enum features {
 	EVENTS_FILE = 1,
-	PROCESS_COUNT = 2,
-	SEGMENT_COUNT = 4,
-	SEGMENT_LOAD = 8,
+	EVENTS_FILLED = 2,
+	EVENTS_DELAYED = 4,
+	PROCESS_COUNT = 8,
+	SEGMENT_COUNT = 16,
+	SEGMENT_LOAD = 32,
 };
 
 enum event_type { ACCESSED = 'F', FAULT = 'H' };
@@ -220,7 +222,8 @@ static atomic_long_t allocated_count = ATOMIC_LONG_INIT(0);
 
 // workqueue for processing window
 static struct workqueue_struct *pw_wq;
-static struct delayed_work process_work_events;
+static struct delayed_work process_work_events_delayed;
+static struct work_struct process_work_events_filled;
 static struct work_struct process_work_segments;
 static unsigned int process_interval_ms = 100;
 
@@ -725,6 +728,12 @@ static void push_event_to_percpu(u64 id, enum event_type type)
 	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
 	unsigned long flags;
 
+	if (is_active(EVENTS_FILLED)) {
+		if (rb->head == 0 && rb->count != 0 && pw_wq) {
+			queue_work(pw_wq, &process_work_events_filled);
+		}
+	}
+
 	// simple sampling based on total events (not perfect but ok)
 	if ((atomic64_read(&stat_events) % sample_rate) != 0) {
 		atomic64_inc(&stat_dropped);
@@ -903,7 +912,7 @@ static void schedule_processing(unsigned long delay_ms)
 {
 	if (!pw_wq)
 		return;
-	queue_delayed_work(pw_wq, &process_work_events, delay_ms);
+	queue_delayed_work(pw_wq, &process_work_events_delayed, delay_ms);
 }
 
 /* processors: wrapper for process events and schedule next */
@@ -1113,9 +1122,10 @@ static int proc_show(struct seq_file *m, void *v)
 
 	seq_printf(
 		m,
-		"# features SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_FILE=%d\n",
+		"# features SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_DELAYED=%d EVENTS_FILLED=%d EVENTS_FILE=%d\n",
 		is_active(SEGMENT_LOAD), is_active(SEGMENT_COUNT),
-		is_active(PROCESS_COUNT), is_active(EVENTS_FILE));
+		is_active(PROCESS_COUNT), is_active(EVENTS_DELAYED),
+		is_active(EVENTS_FILLED), is_active(EVENTS_FILE));
 
 	seq_printf(m, "# mem allocated_bytes=%llu allocated_objects=%llu\n",
 		   (unsigned long long)atomic_long_read(&allocated_bytes),
@@ -1197,6 +1207,18 @@ static const struct proc_ops proc_fops = {
 /* module: validate features active values */
 static void verify_features(void)
 {
+	if (is_active(EVENTS_DELAYED) && is_active(EVENTS_FILLED)) {
+		pr_warn("%s: EVENTS_DELAYED and EVENTS_FILLED feature can't be active together, using EVENTS_FILLED",
+			MODULE_NAME);
+		active &= ~EVENTS_DELAYED;
+	}
+
+	if (is_not_active(EVENTS_DELAYED) && is_not_active(EVENTS_FILLED)) {
+		pr_warn("%s: EVENTS_DELAYED and EVENTS_FILLED feature are disactive, using EVENTS_FILLED",
+			MODULE_NAME);
+		active |= EVENTS_FILLED;
+	}
+
 	if (is_active(SEGMENT_LOAD) && is_not_active(SEGMENT_COUNT)) {
 		pr_warn("%s: forcing SEGMENT_COUNT feature because SEGMENT_LOAD is active\n",
 			MODULE_NAME);
@@ -1303,16 +1325,19 @@ static int start_workers(int *errors)
 		return -ENOMEM;
 	}
 
-	INIT_DELAYED_WORK(&process_work_events, process_events_fn);
-	schedule_processing(process_interval_ms);
-
+	INIT_DELAYED_WORK(&process_work_events_delayed, process_events_fn);
+	INIT_WORK(&process_work_events_filled, process_events);
 	INIT_WORK(&process_work_segments, process_segments);
 
-	if (!process_work_events.wq || !process_work_segments.func) {
+	if (!process_work_events_delayed.work.func ||
+	    !process_work_segments.func) {
 		pr_err("%s: failed create workers\n", MODULE_NAME);
 		*errors |= EWORKERS;
 		return 1;
 	}
+
+	if (is_active(EVENTS_DELAYED))
+		schedule_processing(process_interval_ms);
 
 	return 0;
 }
@@ -1409,7 +1434,8 @@ static int handle_errors(int errors, int *returns)
 	errors >>= 1;
 	// has some error after EWORKERS so cancel workers
 	if (errors) {
-		cancel_delayed_work_sync(&process_work_events);
+		cancel_delayed_work_sync(&process_work_events_delayed);
+		cancel_work_sync(&process_work_events_filled);
 		cancel_work_sync(&process_work_segments);
 	}
 
@@ -1441,10 +1467,10 @@ static int __init pw_init(void)
 	verify_features();
 	verify_params();
 
-	pr_info("%s: features actived (SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_FILE=%d)\n",
+	pr_info("%s: features actived (SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_DELAYED=%d EVENTS_FILLED=%d EVENTS_FILE=%d)\n",
 		MODULE_NAME, is_active(SEGMENT_LOAD), is_active(SEGMENT_COUNT),
-		is_active(PROCESS_COUNT), is_active(EVENTS_FILE));
-
+		is_active(PROCESS_COUNT), is_active(EVENTS_DELAYED),
+		is_active(EVENTS_FILLED), is_active(EVENTS_FILE));
 	init_hashtables();
 
 	ret[0] = alloc_dependencies(&errors);
@@ -1486,12 +1512,15 @@ static void __exit pw_exit(void)
 
 	// cancel work and destroy wq
 	if (pw_wq) {
-		cancel_delayed_work_sync(&process_work_events);
+		cancel_delayed_work_sync(&process_work_events_delayed);
+		cancel_work_sync(&process_work_events_filled);
 		cancel_work_sync(&process_work_segments);
+
 		destroy_workqueue(pw_wq);
 		pw_wq = NULL;
-		close_events_file();
 	}
+
+	close_events_file();
 
 	// remove proc entry
 	if (proc_entry) {
