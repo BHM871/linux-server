@@ -159,9 +159,6 @@ static int proc_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&stat_segments),
 		   (long long)atomic64_read(&stat_segments_loaded));
 	hash_for_each(segments_table, bkt, entrys, node) {
-		unsigned int li = lock_index_for_bucket(bkt);
-		spin_lock(&bucket_locks[li]);
-
 		seq_printf(m, "pid=%i tgid=%i id=%llu pages=",
 			   (unsigned int)entrys->pid,
 			   (unsigned int)entrys->tgid,
@@ -178,7 +175,6 @@ static int proc_show(struct seq_file *m, void *v)
 		}
 
 		seq_printf(m, "\n");
-		spin_unlock(&bucket_locks[li]);
 	}
 
 	seq_printf(m, "\n");
@@ -186,16 +182,11 @@ static int proc_show(struct seq_file *m, void *v)
 	struct processor_count *entryp;
 	seq_printf(m, "# process\n");
 	hash_for_each(processors_table, bkt, entryp, node) {
-		unsigned int li = lock_index_for_bucket(bkt);
-		spin_lock(&bucket_locks[li]);
-
 		seq_printf(m, "pid=%i tgid=%i total=%lld dropped=%lld\n",
 			   (unsigned int)entryp->pid,
 			   (unsigned int)entryp->tgid,
 			   (long long)atomic64_read(&entryp->total),
 			   (long long)atomic64_read(&entryp->dropped));
-
-		spin_unlock(&bucket_locks[li]);
 	}
 
 	return 0;
