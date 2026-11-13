@@ -1229,6 +1229,13 @@ static void verify_features(void)
 /* module: validate params values */
 static void verify_params(void)
 {
+	if (on_ms < 100) {
+		on_ms = max(on_ms, 100);
+
+		pr_warn("%s: 'on_ms' value is invalid, setupping on_ms=%d\n",
+			MODULE_NAME, on_ms);
+	}
+
 	if (sample_rate <= 1) {
 		pr_warn("%s: 'sample_rate' value is invalid, setupping sample_rate=2\n",
 			MODULE_NAME);
@@ -1330,7 +1337,7 @@ static int start_workers(int *errors)
 	INIT_WORK(&process_work_segments, process_segments);
 
 	if (!process_work_events_delayed.work.func ||
-	    !process_work_segments.func) {
+	    !process_work_events_filled.func || !process_work_segments.func) {
 		pr_err("%s: failed create workers\n", MODULE_NAME);
 		*errors |= EWORKERS;
 		return 1;
@@ -1351,7 +1358,7 @@ static enum hrtimer_restart window_timer_cb(struct hrtimer *timer)
 	if (cur_state == WINDOW_OFF) {
 		// turn ON: start on timer and set state
 		cur_state = WINDOW_ON;
-		pr_debug("page_window_rate: window ON\n");
+		pr_debug("%s: window ON\n", MODULE_NAME);
 
 		// start timer for ON duration: rearm for ON -> OFF
 		hrtimer_forward_now(timer, kt_on);
@@ -1359,13 +1366,19 @@ static enum hrtimer_restart window_timer_cb(struct hrtimer *timer)
 	} else {
 		// turning OFF: schedule processing job and set state
 		cur_state = WINDOW_OFF;
-		pr_debug("page_window_rate: window OFF\n");
+		pr_debug("%s: window OFF\n", MODULE_NAME);
 
 		if (pw_wq)
 			queue_work(pw_wq, &process_work_segments);
 
 		// rearm for OFF duration
-		hrtimer_forward_now(timer, kt_off);
+		if (off_ms <= 0) {
+			cur_state = WINDOW_ON;
+			hrtimer_forward_now(timer, kt_on);
+		} else {
+			hrtimer_forward_now(timer, kt_off);
+		}
+
 		return HRTIMER_RESTART;
 	}
 }
@@ -1381,18 +1394,10 @@ static int init_window_timer(int *errors)
 		return 1;
 	}
 
-	if (on_ms <= 0 && off_ms <= 0) {
-		cur_state = WINDOW_OFF;
-		return 0;
-	}
-
-	cur_state = WINDOW_ON;
-	if (off_ms <= 0)
-		return 0;
-
 	kt_on = ms_to_ktime(on_ms);
 	kt_off = ms_to_ktime(off_ms);
 
+	cur_state = WINDOW_ON;
 	hrtimer_start(&window_timer, kt_on, HRTIMER_MODE_REL);
 
 	return 0;
@@ -1460,12 +1465,12 @@ static int __init pw_init(void)
 	int errors = 0;
 	int ret[7];
 
+	verify_features();
+	verify_params();
+
 	pr_info("%s: init (on_ms=%u off_ms=%u sample_rate=%u segments_percentil=%u max_segment_size=%u buf_len=%u hash_bits=%u max_report=%u)\n",
 		MODULE_NAME, on_ms, off_ms, sample_rate, segments_percentil,
 		max_segment_size, buf_len, hash_bits, max_report);
-
-	verify_features();
-	verify_params();
 
 	pr_info("%s: features actived (SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_DELAYED=%d EVENTS_FILLED=%d EVENTS_FILE=%d)\n",
 		MODULE_NAME, is_active(SEGMENT_LOAD), is_active(SEGMENT_COUNT),
