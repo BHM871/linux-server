@@ -185,6 +185,10 @@ struct heap_pair {
 	int capacity;
 };
 
+typedef spinlock_t pair_lock;
+typedef spinlock_t process_lock;
+typedef spinlock_t segment_lock;
+
 // ----------------- variables -----------------
 
 static enum window_state cur_state = WINDOW_OFF;
@@ -203,7 +207,9 @@ static ktime_t kt_off;
 static struct recent_buf __percpu *pcpu_bufs = NULL;
 
 // locks
-static spinlock_t *bucket_locks = NULL; // array of locks for hash buckets
+static pair_lock *pairs_locks = NULL;
+static process_lock *processors_locks = NULL;
+static segment_lock *segments_locks = NULL;
 static unsigned int bucket_lock_count = 256; // will be tuned
 
 // stats
@@ -328,7 +334,7 @@ static inline unsigned int lock_index_for_bucket(u32 bucket)
 
 /* utils: define if segment is loaded or not */
 static void mark_segment_as(struct segment_pages *segment, bool loaded,
-			    spinlock_t *lock)
+			    segment_lock *lock)
 {
 	if (is_not_active(SEGMENT_LOAD))
 		return;
@@ -344,22 +350,25 @@ static void mark_segment_as(struct segment_pages *segment, bool loaded,
 }
 
 /* utils: find a segment and define if it is loaded or not */
-static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded,
-				  spinlock_t *lock)
+static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded)
 {
 	if (is_not_active(SEGMENT_LOAD))
 		return;
 
 	struct segment_pages *entry;
 	u32 h32 = pair_hash_u64(tgid, id);
+	u32 bucket = hash_min(h32, HASH_BITS(segments_table));
+	unsigned int li = lock_index_for_bucket(bucket);
 
-	// already has lock to asscess
+	spin_lock(&segments_locks[li]);
 	hash_for_each_possible(segments_table, entry, node, h32) {
 		if (entry->tgid == tgid && entry->id == id) {
-			mark_segment_as(entry, loaded, lock);
+			mark_segment_as(entry, loaded, &segments_locks[li]);
+			spin_unlock(&segments_locks[li]);
 			return;
 		}
 	}
+	spin_unlock(&segments_locks[li]);
 }
 
 /* utils: calculate percentil */
@@ -467,7 +476,7 @@ static int alloc_percpu_buffers(unsigned int len)
 
 	for_each_possible_cpu(cpu) {
 		struct recent_buf *rb = per_cpu_ptr(pcpu_bufs, cpu);
-		rb->buf = kzalloc(sizeof(struct page_event) * len, GFP_KERNEL);
+		rb->buf = aallocation(len, sizeof(struct page_event));
 		if (!rb->buf)
 			return -ENOMEM;
 
@@ -489,7 +498,7 @@ static void free_percpu_buffers(void)
 	for_each_possible_cpu(cpu) {
 		struct recent_buf *rb = per_cpu_ptr(pcpu_bufs, cpu);
 		if (rb && rb->buf) {
-			kfree(rb->buf);
+			deallocation(rb->buf);
 			rb->buf = NULL;
 		}
 	}
@@ -508,26 +517,40 @@ static void init_bucket_locks(unsigned int buckets)
 		p <<= 1;
 
 	bucket_lock_count = p;
-	bucket_locks =
-		kcalloc(bucket_lock_count, sizeof(spinlock_t), GFP_KERNEL);
+	pairs_locks = aallocation(bucket_lock_count, sizeof(spinlock_t));
+	processors_locks = aallocation(bucket_lock_count, sizeof(spinlock_t));
+	segments_locks = aallocation(bucket_lock_count, sizeof(spinlock_t));
 
-	if (!bucket_locks) {
+	if (!pairs_locks || !processors_locks || !segments_locks) {
 		bucket_lock_count = 1;
 		pr_warn("%s: could not allocate bucket locks, using 1\n",
 			MODULE_NAME);
 		return;
 	}
 
-	for (unsigned int i = 0; i < bucket_lock_count; ++i)
-		spin_lock_init(&bucket_locks[i]);
+	for (unsigned int i = 0; i < bucket_lock_count; ++i) {
+		spin_lock_init(&pairs_locks[i]);
+		spin_lock_init(&processors_locks[i]);
+		spin_lock_init(&segments_locks[i]);
+	}
 }
 
 /* lock: free locks */
 static void free_bucket_locks(void)
 {
-	if (bucket_locks) {
-		kfree(bucket_locks);
-		bucket_locks = NULL;
+	if (pairs_locks) {
+		deallocation(pairs_locks);
+		pairs_locks = NULL;
+	}
+
+	if (processors_locks) {
+		deallocation(processors_locks);
+		processors_locks = NULL;
+	}
+
+	if (segments_locks) {
+		deallocation(segments_locks);
+		segments_locks = NULL;
 	}
 }
 
@@ -543,15 +566,15 @@ static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 	u32 bucket = hash_min(h32, HASH_BITS(pair_table));
 	unsigned int li = lock_index_for_bucket(bucket);
 
-	if (!bucket_locks)
+	if (!pairs_locks)
 		return;
 
-	spin_lock(&bucket_locks[li]);
+	spin_lock(&pairs_locks[li]);
 	hash_for_each_possible(pair_table, entry, node, h32) {
 		if (entry->key.tgid == tgid && entry->key.a == a &&
 		    entry->key.b == b) {
 			atomic64_inc(&entry->count);
-			spin_unlock(&bucket_locks[li]);
+			spin_unlock(&pairs_locks[li]);
 			atomic64_inc(&stat_pairs);
 			return;
 		}
@@ -560,7 +583,7 @@ static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 	// not found -> create
 	entry = (struct pair_entry *)allocation(sizeof(*entry));
 	if (!entry) {
-		spin_unlock(&bucket_locks[li]);
+		spin_unlock(&pairs_locks[li]);
 		return;
 	}
 
@@ -571,9 +594,9 @@ static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 	atomic64_set(&entry->count, 1);
 	hash_add(pair_table, &entry->node, h32);
 
-	mark_segment_by_id_as(tgid, a, false, &bucket_locks[li]);
+	mark_segment_by_id_as(tgid, a, false);
 
-	spin_unlock(&bucket_locks[li]);
+	spin_unlock(&pairs_locks[li]);
 	atomic64_inc(&stat_pairs);
 }
 
@@ -605,16 +628,16 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 	u32 bucket = hash_min(h32, HASH_BITS(processors_table));
 	unsigned int li = lock_index_for_bucket(bucket);
 
-	if (!bucket_locks)
+	if (!processors_locks)
 		return;
 
-	spin_lock(&bucket_locks[li]);
+	spin_lock(&processors_locks[li]);
 	hash_for_each_possible(processors_table, entry, node, h32) {
 		if (entry->pid == pid && entry->tgid == tgid) {
 			if (dropped)
 				atomic64_inc(&entry->dropped);
 			atomic64_inc(&entry->total);
-			spin_unlock(&bucket_locks[li]);
+			spin_unlock(&processors_locks[li]);
 			return;
 		}
 	}
@@ -622,7 +645,7 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 	// not found -> create
 	entry = (struct processor_count *)allocation(sizeof(*entry));
 	if (!entry) {
-		spin_unlock(&bucket_locks[li]);
+		spin_unlock(&processors_locks[li]);
 		return;
 	}
 
@@ -633,7 +656,7 @@ static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 
 	hash_add(processors_table, &entry->node, h32);
 
-	spin_unlock(&bucket_locks[li]);
+	spin_unlock(&processors_locks[li]);
 }
 
 /* processor_table: incrementation */
@@ -663,10 +686,10 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 	u32 bucket = hash_min(h32, HASH_BITS(segments_table));
 	unsigned int li = lock_index_for_bucket(bucket);
 
-	if (!bucket_locks)
+	if (!segments_locks)
 		return;
 
-	spin_lock(&bucket_locks[li]);
+	spin_lock(&segments_locks[li]);
 	hash_for_each_possible(segments_table, entry, node, h32) {
 		if (entry->tgid == tgid && entry->id == id) {
 			entry->pages[entry->head] = page;
@@ -674,7 +697,7 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 			if (entry->count < max_segment_size)
 				entry->count++;
 
-			spin_unlock(&bucket_locks[li]);
+			spin_unlock(&segments_locks[li]);
 			return;
 		}
 	}
@@ -682,14 +705,14 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 	// not found -> create
 	entry = (struct segment_pages *)allocation(sizeof(*entry));
 	if (!entry) {
-		spin_unlock(&bucket_locks[li]);
+		spin_unlock(&segments_locks[li]);
 		return;
 	}
 
 	entry->pages = (u64 *)aallocation(max_segment_size, sizeof(u64));
 	if (!entry->pages) {
 		deallocation(entry);
-		spin_unlock(&bucket_locks[li]);
+		spin_unlock(&segments_locks[li]);
 		return;
 	}
 
@@ -704,7 +727,7 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 
 	hash_add(segments_table, &entry->node, h32);
 
-	spin_unlock(&bucket_locks[li]);
+	spin_unlock(&segments_locks[li]);
 }
 
 /* segments_table: free */
@@ -928,7 +951,7 @@ static void process_events_fn(struct work_struct *work)
 /* processors: find task and load a segment if feature is active
  * only if feature SEGMENT_LOAD is active
  * */
-static void prefetch_segment(struct segment_pages *segment, spinlock_t *lock)
+static void prefetch_segment(struct segment_pages *segment, segment_lock *lock)
 {
 	if (is_not_active(SEGMENT_LOAD))
 		return;
@@ -987,9 +1010,9 @@ static void prefetch_segments(void)
 
 	hash_for_each(segments_table, bucket, entry, node) {
 		unsigned int li = lock_index_for_bucket(bucket);
-		spin_lock(&bucket_locks[li]);
-		prefetch_segment(entry, &bucket_locks[li]);
-		spin_unlock(&bucket_locks[li]);
+		spin_lock(&segments_locks[li]);
+		prefetch_segment(entry, &segments_locks[li]);
+		spin_unlock(&segments_locks[li]);
 	}
 }
 
