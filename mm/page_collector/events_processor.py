@@ -17,6 +17,7 @@ def create_database(db):
 
         CREATE TABLE process_stats (
             pid TEXT PRIMARY KEY,
+            tgid TEXT NOT NULL,
             comm TEXT NOT NULL,
             total_events INTEGER NOT NULL DEFAULT 0,
             total_h INTEGER NOT NULL DEFAULT 0,
@@ -58,16 +59,16 @@ def process_csv(csv_path, db):
             with db:
                 db.executemany("""
                     INSERT INTO process_stats
-                        (pid, comm, total_events, total_h, total_f)
-                    VALUES (?, ?, ?, ?, ?)
+                        (pid, tgid, comm, total_events, total_h, total_f)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(pid) DO UPDATE SET
                         total_events =
                             total_events + excluded.total_events,
                         total_h = total_h + excluded.total_h,
                         total_f = total_f + excluded.total_f
                 """, [
-                    (pid, comm, *counts)
-                    for (pid, comm), counts in batch_stats.items()
+                    (pid, tgid, comm, *counts)
+                    for (pid, tgid, comm), counts in batch_stats.items()
                 ])
 
                 db.executemany("""
@@ -87,24 +88,26 @@ def process_csv(csv_path, db):
         for row in reader:
             try:
                 pid = row["pid"].strip()
+                tgid = row["tgid"].strip()
                 page_id = row["page_id"].strip()
                 event_type = row["event_type"].strip().upper()
                 comm = row["comm"].strip()
 
-                if not pid or not page_id or not comm:
+                if not pid or not tgid or not page_id or not comm:
                     raise ValueError("PID, TGID, página ou command vazio")
 
                 if event_type not in {"H", "F"}:
                     raise ValueError("Tipo de evento inválido")
 
                 int(pid)
+                int(tgid)
                 int(page_id)
 
             except (ValueError, TypeError, AttributeError):
                 ignored += 1
                 continue
 
-            key = (pid, comm)
+            key = (pid, tgid, comm)
             if key not in batch_stats:
                 batch_stats[key] = [0, 0, 0]
 
@@ -148,17 +151,17 @@ def export_csvs(db, output_dir):
     # 1. Resumo por processo
     def process_summary():
         rows = db.execute("""
-            SELECT pid, comm, total_events, total_h, total_f
+            SELECT pid, tgid, comm, total_events, total_h, total_f
             FROM process_stats
             ORDER BY CAST(pid AS INTEGER)
         """)
 
-        for pid, comm, total, h_count, f_count in rows:
+        for pid, tgid, comm, total, h_count, f_count in rows:
             h_rate = h_count / total if total else 0
             f_rate = f_count / total if total else 0
 
             yield (
-                pid, comm, total, h_count, f_count,
+                pid, tgid, comm, total, h_count, f_count,
                 f"{h_rate:.8f}", f"{f_rate:.8f}"
             )
 
@@ -166,6 +169,7 @@ def export_csvs(db, output_dir):
         output_dir / "processos.csv",
         [
             "processo",
+            "thread group",
             "name",
             "total_eventos",
             "total_H",
