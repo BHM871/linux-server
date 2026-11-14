@@ -1072,6 +1072,10 @@ static void prefetch_segment(struct segment_pages *segment, segment_lock *lock)
 	spin_unlock(lock);
 }
 
+/*
+ * global: get segemnt by current->tgid and fault page and load
+ * only if feature 'SEGMENT_LOAD_INSTANT' is active
+ */
 static void prefetch_segment_by_id(pid_t tgid, u64 id)
 {
 	if (is_not_active(SEGMENT_LOAD_INSTANT))
