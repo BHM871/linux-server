@@ -1298,7 +1298,7 @@ static int proc_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&stat_segments),
 		   (long long)atomic64_read(&stat_segments_loaded));
 	hash_for_each(segments_table, bkt, entrys, node) {
-		seq_printf(m, "pid=%i tgid=%i id=%llu pages=",
+		seq_printf(m, "pid=%i tgid=%i id=%llx pages=",
 			   (unsigned int)entrys->pid,
 			   (unsigned int)entrys->tgid,
 			   (unsigned long long)entrys->id);
@@ -1308,7 +1308,7 @@ static int proc_show(struct seq_file *m, void *v)
 		for (int i = 0; i < max_segment_size && i < entrys->count;
 		     i++) {
 			seq_printf(
-				m, "%llu;",
+				m, "%llx;",
 				(unsigned long long)entrys
 					->pages[(idx + i) % max_segment_size]);
 		}
