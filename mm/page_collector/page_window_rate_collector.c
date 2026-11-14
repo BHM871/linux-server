@@ -2,6 +2,7 @@
 // Windowed page-access collector using kprobes + hrtimer + per-cpu buffers.
 // Target: x86_64 kernels (tested conceptually for linux 6.12.x).
 
+#include <linux/llist.h>
 #include <linux/pid.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -70,7 +71,7 @@ static unsigned int max_report = 20000;
 module_param(max_report, uint, 0444);
 MODULE_PARM_DESC(max_report, "Max entries printed via /proc");
 
-static unsigned short active = 15; // bit set to define features active
+static unsigned short active = 123; // bit set to define features active
 module_param(active, ushort, 0444);
 MODULE_PARM_DESC(
 	active,
@@ -114,7 +115,8 @@ enum features {
 	EVENTS_DELAYED = 4,
 	PROCESS_COUNT = 8,
 	SEGMENT_COUNT = 16,
-	SEGMENT_LOAD = 32,
+	SEGMENT_LOAD_LAZY = 32,
+	SEGMENT_LOAD_INSTANT = 64,
 };
 
 enum event_type { ACCESSED = 'F', FAULT = 'H' };
@@ -174,6 +176,12 @@ struct segment_pages {
 	unsigned int count;
 };
 
+struct load_segment {
+	struct llist_node node;
+	pid_t tgid;
+	u64 page;
+};
+
 struct heap_pair_entry {
 	struct pair_key key;
 	u64 count;
@@ -212,6 +220,12 @@ static process_lock *processors_locks = NULL;
 static segment_lock *segments_locks = NULL;
 static unsigned int bucket_lock_count = 256; // will be tuned
 
+/* heap: struct object */
+static struct heap_pair heap;
+
+/* queue: struct object */
+static LLIST_HEAD(load_segment_requests);
+
 // stats
 static atomic64_t stat_events = ATOMIC64_INIT(0);
 static atomic64_t stat_dropped = ATOMIC64_INIT(0);
@@ -231,7 +245,8 @@ static struct workqueue_struct *pw_wq;
 static struct delayed_work process_work_events_delayed;
 static struct work_struct process_work_events_filled;
 static struct work_struct process_work_segments;
-static unsigned int process_interval_ms = 100;
+static struct work_struct process_work_load_segment;
+static unsigned int process_interval_ms = 500;
 
 // events file
 static struct file *events_file;
@@ -332,11 +347,40 @@ static inline unsigned int lock_index_for_bucket(u32 bucket)
 
 // segments
 
-/* utils: define if segment is loaded or not */
-static void mark_segment_as(struct segment_pages *segment, bool loaded,
-			    segment_lock *lock)
+/* utils: calculate percentil */
+static u64 calculate_percentil(int percentil, u64 elements)
 {
-	if (is_not_active(SEGMENT_LOAD))
+	u64 per = (elements * percentil) / 100;
+	return clamp(per, 0, elements - 1);
+}
+
+// ----------------- global access -----------------
+
+// segments
+
+/* global: find task and load a segment if feature is active
+ * only if feature 'SEGMENT_LOAD_LAZY' or 'SEGMENT_LOAD_INSTANT' is active
+ * */
+static void prefetch_segment(struct segment_pages *segment, segment_lock *lock);
+
+/*
+ * global: get segemnt by current->tgid and fault page and load
+ * only if feature 'SEGMENT_LOAD_INSTANT' is active
+ */
+static void prefetch_segment_by_id(pid_t tgid, u64 id);
+
+/*
+ * global: walk through segments_table and load segments
+ * only if feature 'SEGMENT_LOAD_LAZY' is active
+ */
+static void prefetch_segments(void);
+
+/* global: define if segment is loaded or not
+ * only if some 'SEGMENT_LOAD_*' is active
+ * */
+static void mark_segment_as(struct segment_pages *segment, bool loaded)
+{
+	if (is_not_active(SEGMENT_LOAD_LAZY | SEGMENT_LOAD_INSTANT))
 		return;
 
 	if (segment->loaded == loaded)
@@ -349,10 +393,12 @@ static void mark_segment_as(struct segment_pages *segment, bool loaded,
 		atomic64_dec(&stat_segments_loaded);
 }
 
-/* utils: find a segment and define if it is loaded or not */
+/* global: find a segment and define if it is loaded or not
+ * only if some 'SEGMENT_LOAD_*' is active
+ * */
 static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded)
 {
-	if (is_not_active(SEGMENT_LOAD))
+	if (is_not_active(SEGMENT_LOAD_LAZY | SEGMENT_LOAD_INSTANT))
 		return;
 
 	struct segment_pages *entry;
@@ -363,7 +409,7 @@ static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded)
 	spin_lock(&segments_locks[li]);
 	hash_for_each_possible(segments_table, entry, node, h32) {
 		if (entry->tgid == tgid && entry->id == id) {
-			mark_segment_as(entry, loaded, &segments_locks[li]);
+			mark_segment_as(entry, loaded);
 			spin_unlock(&segments_locks[li]);
 			return;
 		}
@@ -371,17 +417,48 @@ static void mark_segment_by_id_as(pid_t tgid, u64 id, bool loaded)
 	spin_unlock(&segments_locks[li]);
 }
 
-/* utils: calculate percentil */
-static u64 calculate_percentil(int percentil, u64 elements)
+/* global: push a request of struct load_segment
+ * only if has a workqueue and 'SEGMENT_LOAD_INSTANT' is active
+ * */
+static void push_load_request(pid_t tgid, u64 page)
 {
-	u64 per = (elements * percentil) / 100;
-	return clamp(per, 0, elements - 1);
+	if (is_not_active(SEGMENT_LOAD_INSTANT) || !pw_wq)
+		return;
+
+	struct load_segment *req;
+
+	req = allocation(sizeof(*req));
+	if (!req)
+		return;
+
+	req->tgid = tgid;
+	req->page = page;
+
+	llist_add(&req->node, &load_segment_requests);
+	queue_work(pw_wq, &process_work_load_segment);
+}
+
+/* global: find a segment and define if it is loaded or not
+ * only if some SEGMENT_LOAD_* is active
+ * */
+static void free_load_requests(void)
+{
+	struct llist_node *node;
+
+	node = llist_del_all(&load_segment_requests);
+
+	while (node) {
+		struct load_segment *req;
+		struct llist_node *next = node->next;
+
+		req = llist_entry(node, struct load_segment, node);
+
+		deallocation(req);
+		node = next;
+	}
 }
 
 // ----------------- heap tree -----------------
-
-/* heap: struct object */
-static struct heap_pair heap;
 
 /* heap: swap two heap.items */
 static void heap_swap(struct heap_pair *heap, int a, int b)
@@ -616,7 +693,7 @@ static void free_pair_table(void)
 // processor table
 
 /* processor_table: incrementation
- * only if feature PROCESS_COUNT is active
+ * only if feature 'PROCESS_COUNT' is active
  * */
 static void processors_table_inc(pid_t pid, pid_t tgid, u64 page, bool dropped)
 {
@@ -674,7 +751,7 @@ static void free_processors_table(void)
 // segments table
 
 /* segments_table: incrementation
- * only if feature SEGMENT_COUNT is active
+ * only if feature 'SEGMENT_COUNT' is active
  * */
 static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 {
@@ -751,10 +828,17 @@ static void push_event_to_percpu(u64 id, enum event_type type)
 	struct recent_buf *rb = this_cpu_ptr(pcpu_bufs);
 	unsigned long flags;
 
+	const pid_t pid = current->pid;
+	const pid_t tgid = current->tgid;
+
 	if (is_active(EVENTS_FILLED)) {
 		if (rb->head == 0 && rb->count != 0 && pw_wq) {
 			queue_work(pw_wq, &process_work_events_filled);
 		}
+	}
+
+	if (is_active(SEGMENT_LOAD_INSTANT)) {
+		push_load_request(tgid, id);
 	}
 
 	// simple sampling based on total events (not perfect but ok)
@@ -762,7 +846,7 @@ static void push_event_to_percpu(u64 id, enum event_type type)
 		atomic64_inc(&stat_dropped);
 		atomic64_inc(&stat_events);
 
-		processors_table_inc(current->pid, current->tgid, id, 1);
+		processors_table_inc(pid, tgid, id, 1);
 		return;
 	}
 
@@ -770,8 +854,8 @@ static void push_event_to_percpu(u64 id, enum event_type type)
 	spin_lock_irqsave(&rb->lock, flags);
 
 	rb->buf[rb->head].ts_ns = ktime_get_ns();
-	rb->buf[rb->head].pid = current->pid;
-	rb->buf[rb->head].tgid = current->tgid;
+	rb->buf[rb->head].pid = pid;
+	rb->buf[rb->head].tgid = tgid;
 	memcpy(rb->buf[rb->head].comm, current->comm, TASK_COMM_LEN);
 
 	rb->buf[rb->head].id = id;
@@ -781,7 +865,7 @@ static void push_event_to_percpu(u64 id, enum event_type type)
 	if (rb->count < buf_len)
 		rb->count++;
 
-	processors_table_inc(current->pid, current->tgid, id, 0);
+	processors_table_inc(pid, tgid, id, 0);
 
 	spin_unlock_irqrestore(&rb->lock, flags);
 
@@ -828,7 +912,7 @@ static unsigned int snapshot_percpu_buffer(int cpu, struct page_event *out_buf,
 // ---------------- file helper ----------------
 
 /* file: open event file stream
- * only if feature EVENTS_FILE is active
+ * only if feature 'EVENTS_FILE' is active
  * */
 static int open_events_file(void)
 {
@@ -948,21 +1032,32 @@ static void process_events_fn(struct work_struct *work)
 
 // segments
 
-/* processors: find task and load a segment if feature is active
- * only if feature SEGMENT_LOAD is active
+/* global-implementation: find task and load a segment if feature is active
+ * only if feature 'SEGMENT_LOAD_LAZY' or 'SEGMENT_LOAD_INSTANT' is active
  * */
 static void prefetch_segment(struct segment_pages *segment, segment_lock *lock)
 {
-	if (is_not_active(SEGMENT_LOAD))
+	if (is_not_active(SEGMENT_LOAD_LAZY | SEGMENT_LOAD_INSTANT))
 		return;
 
-	if (segment->loaded)
-		return;
+	unsigned int idx, i, out;
+	unsigned int count;
+	unsigned int head;
 
 	struct pid *pid;
 	struct task_struct *task;
 	u8 value;
-	unsigned int idx, i, out;
+
+	spin_lock(lock);
+	if (segment->loaded) {
+		spin_unlock(lock);
+		return;
+	}
+
+	count = segment->count;
+	head = segment->head;
+
+	spin_unlock(lock);
 
 	pid = find_get_pid(segment->pid);
 	if (!pid)
@@ -974,11 +1069,8 @@ static void prefetch_segment(struct segment_pages *segment, segment_lock *lock)
 	if (!task)
 		return;
 
-	idx = (segment->head - segment->count + max_segment_size) %
-	      max_segment_size;
-
-	for (i = 0; i < segment->count; i++) {
-		idx = (idx + 1) % max_segment_size;
+	for (i = 0; i < count; i++) {
+		idx = (head - count + max_segment_size + i) % max_segment_size;
 		unsigned long long addr = segment->pages[idx];
 
 		if ((addr & ID_IS_PFN_FLAG))
@@ -993,16 +1085,37 @@ static void prefetch_segment(struct segment_pages *segment, segment_lock *lock)
 	}
 
 	put_task_struct(task);
-	mark_segment_as(segment, true, lock);
+
+	spin_lock(lock);
+	mark_segment_as(segment, true);
+	spin_unlock(lock);
+}
+
+static void prefetch_segment_by_id(pid_t tgid, u64 id)
+{
+	if (is_not_active(SEGMENT_LOAD_INSTANT))
+		return;
+
+	struct segment_pages *entry;
+	u32 h32 = pair_hash_u64(tgid, id);
+	u32 bucket = hash_min(h32, HASH_BITS(segments_table));
+	unsigned int li = lock_index_for_bucket(bucket);
+
+	hash_for_each_possible(segments_table, entry, node, h32) {
+		if (entry->tgid == tgid && entry->id == id) {
+			prefetch_segment(entry, &segments_locks[li]);
+			break;
+		}
+	}
 }
 
 /*
- * processors: walk through segments_table and load segments
- * only if feature SEGMENT_LOAD is active
+ * global-implementation: walk through segments_table and load segments
+ * only if feature 'SEGMENT_LOAD_LAZY' is active
  */
 static void prefetch_segments(void)
 {
-	if (is_not_active(SEGMENT_LOAD))
+	if (is_not_active(SEGMENT_LOAD_LAZY))
 		return;
 
 	struct segment_pages *entry;
@@ -1010,15 +1123,13 @@ static void prefetch_segments(void)
 
 	hash_for_each(segments_table, bucket, entry, node) {
 		unsigned int li = lock_index_for_bucket(bucket);
-		spin_lock(&segments_locks[li]);
 		prefetch_segment(entry, &segments_locks[li]);
-		spin_unlock(&segments_locks[li]);
 	}
 }
 
 /*
  * processors: consume heap with pair_table elements and create segments
- * only if feature SEGMENT_LOAD is active
+ * only if feature 'SEGMENT_COUNT' is active
  */
 static void process_segments(struct work_struct *work)
 {
@@ -1049,6 +1160,33 @@ static void process_segments(struct work_struct *work)
 	}
 
 	prefetch_segments();
+}
+
+/*
+ * processors: get the load values to segment load
+ * only if feature 'SEGMENT_LOAD_INSTANT' is active
+ */
+static void process_load_segment(struct work_struct *work)
+{
+	if (is_not_active(SEGMENT_LOAD_INSTANT))
+		return;
+
+	struct llist_node *node;
+
+	while ((node = llist_del_all(&load_segment_requests)) != NULL) {
+		node = llist_reverse_order(node);
+
+		while (node) {
+			struct load_segment *req;
+			struct llist_node *next = node->next;
+
+			req = llist_entry(node, struct load_segment, node);
+			prefetch_segment_by_id(req->tgid, req->page);
+
+			deallocation(req);
+			node = next;
+		}
+	}
 }
 
 // ---------------- handles ----------------
@@ -1145,10 +1283,11 @@ static int proc_show(struct seq_file *m, void *v)
 
 	seq_printf(
 		m,
-		"# features SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_DELAYED=%d EVENTS_FILLED=%d EVENTS_FILE=%d\n",
-		is_active(SEGMENT_LOAD), is_active(SEGMENT_COUNT),
-		is_active(PROCESS_COUNT), is_active(EVENTS_DELAYED),
-		is_active(EVENTS_FILLED), is_active(EVENTS_FILE));
+		"# features SEGMENT_LOAD_LAZY=%d SEGMENT_LOAD_INSTANT=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_DELAYED=%d EVENTS_FILLED=%d EVENTS_FILE=%d\n",
+		is_active(SEGMENT_LOAD_LAZY), is_active(SEGMENT_LOAD_INSTANT),
+		is_active(SEGMENT_COUNT), is_active(PROCESS_COUNT),
+		is_active(EVENTS_DELAYED), is_active(EVENTS_FILLED),
+		is_active(EVENTS_FILE));
 
 	seq_printf(m, "# mem allocated_bytes=%llu allocated_objects=%llu\n",
 		   (unsigned long long)atomic_long_read(&allocated_bytes),
@@ -1242,8 +1381,9 @@ static void verify_features(void)
 		active |= EVENTS_FILLED;
 	}
 
-	if (is_active(SEGMENT_LOAD) && is_not_active(SEGMENT_COUNT)) {
-		pr_warn("%s: forcing SEGMENT_COUNT feature because SEGMENT_LOAD is active\n",
+	if (is_active(SEGMENT_LOAD_LAZY | SEGMENT_LOAD_INSTANT) &&
+	    is_not_active(SEGMENT_COUNT)) {
+		pr_warn("%s: forcing SEGMENT_COUNT feature because SEGMENT_LOAD_* is active\n",
 			MODULE_NAME);
 		active |= SEGMENT_COUNT;
 	}
@@ -1358,9 +1498,11 @@ static int start_workers(int *errors)
 	INIT_DELAYED_WORK(&process_work_events_delayed, process_events_fn);
 	INIT_WORK(&process_work_events_filled, process_events);
 	INIT_WORK(&process_work_segments, process_segments);
+	INIT_WORK(&process_work_load_segment, process_load_segment);
 
 	if (!process_work_events_delayed.work.func ||
-	    !process_work_events_filled.func || !process_work_segments.func) {
+	    !process_work_events_filled.func || !process_work_segments.func ||
+	    !process_work_load_segment.func) {
 		pr_err("%s: failed create workers\n", MODULE_NAME);
 		*errors |= EWORKERS;
 		return 1;
@@ -1465,6 +1607,7 @@ static int handle_errors(int errors, int *returns)
 		cancel_delayed_work_sync(&process_work_events_delayed);
 		cancel_work_sync(&process_work_events_filled);
 		cancel_work_sync(&process_work_segments);
+		cancel_work_sync(&process_work_load_segment);
 	}
 
 	errors >>= 1;
@@ -1495,10 +1638,12 @@ static int __init pw_init(void)
 		MODULE_NAME, on_ms, off_ms, sample_rate, segments_percentil,
 		max_segment_size, buf_len, hash_bits, max_report);
 
-	pr_info("%s: features actived (SEGMENT_LOAD=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_DELAYED=%d EVENTS_FILLED=%d EVENTS_FILE=%d)\n",
-		MODULE_NAME, is_active(SEGMENT_LOAD), is_active(SEGMENT_COUNT),
+	pr_info("%s: features actived (SEGMENT_LOAD_LAZY=%d SEGMENT_LOAD_INSTANT=%d SEGMENT_COUNT=%d PROCESS_COUNT=%d EVENTS_DELAYED=%d EVENTS_FILLED=%d EVENTS_FILE=%d)\n",
+		MODULE_NAME, is_active(SEGMENT_LOAD_LAZY),
+		is_active(SEGMENT_LOAD_INSTANT), is_active(SEGMENT_COUNT),
 		is_active(PROCESS_COUNT), is_active(EVENTS_DELAYED),
 		is_active(EVENTS_FILLED), is_active(EVENTS_FILE));
+
 	init_hashtables();
 
 	ret[0] = alloc_dependencies(&errors);
@@ -1543,6 +1688,7 @@ static void __exit pw_exit(void)
 		cancel_delayed_work_sync(&process_work_events_delayed);
 		cancel_work_sync(&process_work_events_filled);
 		cancel_work_sync(&process_work_segments);
+		cancel_work_sync(&process_work_load_segment);
 
 		destroy_workqueue(pw_wq);
 		pw_wq = NULL;
@@ -1557,6 +1703,7 @@ static void __exit pw_exit(void)
 	}
 
 	deallocation(heap.items);
+	free_load_requests();
 
 	// free tables
 	free_pair_table();
