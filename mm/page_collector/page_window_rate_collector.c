@@ -2,6 +2,8 @@
 // Windowed page-access collector using kprobes + hrtimer + per-cpu buffers.
 // Target: x86_64 kernels (tested conceptually for linux 6.12.x).
 
+#include <linux/sort.h>
+#include <linux/min_heap.h>
 #include <linux/llist.h>
 #include <linux/pid.h>
 #include <linux/mm.h>
@@ -187,12 +189,6 @@ struct heap_pair_entry {
 	u64 count;
 };
 
-struct heap_pair {
-	struct heap_pair_entry *items;
-	int size;
-	int capacity;
-};
-
 typedef spinlock_t pair_lock;
 typedef spinlock_t process_lock;
 typedef spinlock_t segment_lock;
@@ -221,6 +217,7 @@ static segment_lock *segments_locks = NULL;
 static unsigned int bucket_lock_count = 256; // will be tuned
 
 /* heap: struct object */
+DEFINE_MIN_HEAP(struct heap_pair_entry, heap_pair);
 static struct heap_pair heap;
 
 /* queue: struct object */
@@ -460,68 +457,52 @@ static void free_load_requests(void)
 
 // ----------------- heap tree -----------------
 
-/* heap: swap two heap.items */
-static void heap_swap(struct heap_pair *heap, int a, int b)
+/* heap: comparator to ordenate heap */
+static int heap_pair_entry_cmp(const void *lhs, const void *rhs)
 {
-	struct heap_pair_entry tmp = heap->items[a];
-	heap->items[a] = heap->items[b];
-	heap->items[b] = tmp;
+	const struct heap_pair_entry *a = lhs;
+	const struct heap_pair_entry *b = rhs;
+
+	if (a->count < b->count)
+		return -1;
+
+	if (a->count > b->count)
+		return 1;
+
+	return 0;
 }
 
-/* heap: shift up element of 'index' */
-static void heap_shift_up(struct heap_pair *heap, int index)
+/* heap: order min heap by less */
+static bool heap_pair_less(const void *lhs, const void *rhs, void *args)
 {
-	while (index > 0) {
-		int parent = (index - 1) / 2;
+	const struct heap_pair_entry *a = lhs;
+	const struct heap_pair_entry *b = rhs;
 
-		if (heap->items[parent].count <= heap->items[index].count)
-			break;
-
-		heap_swap(heap, parent, index);
-		index = parent;
-	}
+	return a->count < b->count;
 }
 
-/* heap: shift down element of 'index' */
-static void heap_shift_down(struct heap_pair *heap, int index)
-{
-	while (index <= heap->capacity) {
-		int left = index * 2 + 1;
-		int rigth = index * 2 + 2;
-		int smallest = index;
-
-		if (left < heap->size &&
-		    heap->items[left].count < heap->items[smallest].count)
-			smallest = left;
-
-		if (rigth < heap->size &&
-		    heap->items[rigth].count < heap->items[smallest].count)
-			smallest = rigth;
-
-		if (smallest == index)
-			break;
-
-		heap_swap(heap, smallest, index);
-		index = smallest;
-	}
-}
+/* heap: min heap callbacks */
+static const struct min_heap_callbacks heap_callbacks = {
+	.less = heap_pair_less,
+	.swp = NULL,
+};
 
 /* heap: insert a element in heap */
-static void heap_push(struct heap_pair *heap, struct heap_pair_entry entry)
+static void heap_push(struct heap_pair_entry entry)
 {
-	if (heap->size < heap->capacity) {
-		heap->items[heap->size] = entry;
-		heap_shift_up(heap, heap->size);
-		heap->size++;
+	struct heap_pair_entry *min;
+
+	if (heap.nr < heap.size) {
+		min_heap_push_inline(&heap, &entry, &heap_callbacks, NULL);
 
 		return;
 	}
 
-	if (entry.count <= heap->items[0].count)
-		return;
+	min = min_heap_peek_inline(&heap);
 
-	heap->items[0] = entry;
-	heap_shift_down(heap, 0);
+	if (min && entry.count > min->count) {
+		min_heap_pop_push_inline(&heap, &entry, &heap_callbacks, NULL);
+	}
 }
 
 /* heap: walk through pair table and insert heap  */
@@ -530,14 +511,14 @@ static void fill_heap_pair_entry(void)
 	struct pair_entry *entry;
 	unsigned int bkt;
 
-	heap.size = 0;
+	heap.nr = 0;
 
 	hash_for_each(pair_table, bkt, entry, node) {
 		struct heap_pair_entry item = {
 			.key = entry->key,
 			.count = atomic64_read(&entry->count),
 		};
-		heap_push(&heap, item);
+		heap_push(item);
 	}
 }
 
@@ -1141,17 +1122,19 @@ static void process_segments(struct work_struct *work)
 	u64 limit;
 
 	fill_heap_pair_entry();
-	if (heap.size <= 0)
+	if (heap.nr <= 0)
 		return;
 
-	size = min(heap.size, heap.capacity);
+	sort(heap.data, heap.nr, sizeof(*heap.data), heap_pair_entry_cmp, NULL);
+
+	size = heap.nr;
 	per = calculate_percentil(segments_percentil, size);
 
-	limit = heap.items[size - 1].count;
+	limit = heap.data[size - 1].count;
 	limit = calculate_percentil(segments_percentil, limit);
 
 	for (int i = size - 1; i >= per; i--) {
-		entry = &heap.items[i];
+		entry = &heap.data[i];
 		if (entry->count < limit)
 			break;
 
@@ -1470,16 +1453,13 @@ static int alloc_dependencies(int *errors)
 		return ret;
 	}
 
-	heap.size = 0;
-	heap.capacity = max_report;
-	heap.items = (struct heap_pair_entry *)aallocation(
-		max_report, sizeof(struct heap_pair_entry));
-
-	if (!heap.items) {
+	heap.data = aallocation(max_report, sizeof(struct heap_pair_entry));
+	if (!heap.data) {
 		pr_err("%s: failed to create heap list\n", MODULE_NAME);
 		*errors |= EMIN_HEAP;
 		return -ENOMEM;
 	}
+	min_heap_init_inline(&heap, heap.data, max_report);
 
 	return 0;
 }
@@ -1591,7 +1571,10 @@ static int handle_errors(int errors, int *returns)
 	errors >>= 1;
 	// has some error after EMIN_HEAP so free heap
 	if (errors) {
-		deallocation(heap.items);
+		deallocation(heap.data);
+		heap.data = NULL;
+		heap.nr = 0;
+		heap.size = 0;
 	}
 
 	errors >>= 1;
@@ -1702,7 +1685,10 @@ static void __exit pw_exit(void)
 		proc_entry = NULL;
 	}
 
-	deallocation(heap.items);
+	deallocation(heap.data);
+	heap.data = NULL;
+	heap.nr = 0;
+	heap.size = 0;
 	free_load_requests();
 
 	// free tables
