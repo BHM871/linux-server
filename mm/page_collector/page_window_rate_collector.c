@@ -33,11 +33,11 @@ MODULE_DESCRIPTION(
 MODULE_VERSION("0.4");
 
 // ---------------- module parameters ----------------
-static unsigned int on_ms = 10; // collect window in ms
+static unsigned int on_ms = 4000; // collect window in ms
 module_param(on_ms, uint, 0644);
 MODULE_PARM_DESC(on_ms, "Collecting window duration in ms (default 10ms)");
 
-static unsigned int off_ms = 90; // idle window in ms
+static unsigned int off_ms = 1000; // idle window in ms
 module_param(off_ms, uint, 0644);
 MODULE_PARM_DESC(off_ms, "Idle window duration in ms (default 90ms)");
 
@@ -1294,35 +1294,12 @@ static int proc_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&folio_mark_hits),
 		   (long long)atomic64_read(&handle_fault_hits));
 
-	seq_printf(m, "\n");
-
-	struct segment_pages *entrys;
-	unsigned bkt;
 	seq_printf(m, "# segments segments_count=%lld segments_loaded=%lld\n",
 		   (long long)atomic64_read(&stat_segments),
 		   (long long)atomic64_read(&stat_segments_loaded));
-	hash_for_each(segments_table, bkt, entrys, node) {
-		seq_printf(m, "pid=%i tgid=%i id=%llx pages=",
-			   (unsigned int)entrys->pid,
-			   (unsigned int)entrys->tgid,
-			   (unsigned long long)entrys->id);
-
-		int idx = (entrys->head - entrys->count + max_segment_size) %
-			  max_segment_size;
-		for (int i = 0; i < max_segment_size && i < entrys->count;
-		     i++) {
-			seq_printf(
-				m, "%llx;",
-				(unsigned long long)entrys
-					->pages[(idx + i) % max_segment_size]);
-		}
-
-		seq_printf(m, "\n");
-	}
-
-	seq_printf(m, "\n");
 
 	struct processor_count *entryp;
+	unsigned int bkt;
 	seq_printf(m, "# process\n");
 	hash_for_each(processors_table, bkt, entryp, node) {
 		seq_printf(m, "pid=%i tgid=%i total=%lld dropped=%lld\n",
