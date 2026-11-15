@@ -18,15 +18,19 @@ function save_logs() {
 		local file_name=$(echo $file | cut -d '/' -f 2)
 		local initial_name=$(echo $file_name | cut -d '_' -f 1)
 
-		if [[ "$file_name" == "pids" ]]; then
-			cp "$LOGDIR/$file" "$DATADIR/$file_name-$log_name"
-		elif [[ "$initial_name" != "initial" && "$initial_name" != "final" ]]; then
-			cat "$LOGDIR/$file" >>"$DATADIR/$log_name"
-			echo "------------------------------------------------------------------------------------" >>"$DATADIR/$log_name"
-			echo "------------------------------------------------------------------------------------" >>"$DATADIR/$log_name"
-		else
-			cp "$LOGDIR/$file" "$DATADIR/$(echo $initial_name)_dump_$log_name"
+		if [[ -d "$LOGDIR/$file" ]]; then
+			cp -r "$LOGDIR/$file" "$DATADIR/$1"
+			continue
 		fi
+
+		if [[ "$initial_name" == "initial" || "$initial_name" == "final" ]]; then
+			cp "$LOGDIR/$file" "$DATADIR/$(echo $initial_name)_dump_$log_name"
+			continue
+		fi
+
+		cat "$LOGDIR/$file" >>"$DATADIR/$log_name"
+		echo "------------------------------------------------------------------------------------" >>"$DATADIR/$log_name"
+		echo "------------------------------------------------------------------------------------" >>"$DATADIR/$log_name"
 	done
 
 	if [[ "$log_name" != "normal.log" ]]; then
@@ -41,10 +45,22 @@ function run_bench() {
 	local proc="$1"
 
 	cd "benchmarks"
-	local time=$(sudo ./run_all_benchmarks.sh "$proc" | tail -n 1)
+
+	sudo ./run_all_benchmarks.sh "$proc" >tmp_bench &
+	bench_pid=$!
+
+	sudo ./collect_proc.sh --output "bench_logs/memory" &
+	collector_pid=$!
+
+	wait "$bench_pid"
+	kill -9 "$collector_pid"
+
+	local timer=$(tail -n 1 <tmp_bench)
+	rm tmp_bench
+
 	cd ".."
 
-	echo "$time"
+	echo "$timer"
 }
 
 function run_test() {
