@@ -2,6 +2,8 @@
 // Windowed page-access collector using kprobes + hrtimer + per-cpu buffers.
 // Target: x86_64 kernels (tested conceptually for linux 6.12.x).
 
+#include <linux/sched.h>
+#include <linux/types.h>
 #include <linux/sort.h>
 #include <linux/min_heap.h>
 #include <linux/llist.h>
@@ -43,7 +45,12 @@ MODULE_PARM_DESC(off_ms, "Idle window duration in ms (default 90ms)");
 
 static unsigned long delta_ns = 10000000UL; // 10 ms default
 module_param(delta_ns, ulong, 0644);
-MODULE_PARM_DESC(delta_ns, "Idle window duration in ms (default 90ms)");
+MODULE_PARM_DESC(delta_ns, "Delta time to consider a pair (default 10ms)");
+
+static unsigned long instant_cooldown_ms = 1000UL; // 1000 ms default
+module_param(instant_cooldown_ms, ulong, 0644);
+MODULE_PARM_DESC(instant_cooldown_ms,
+		 "Cooldown to load a segment instant (default 1s)");
 
 static unsigned int sample_rate = 2; // keep every Nth event (1 = no sampling)
 module_param(sample_rate, uint, 0644);
@@ -98,6 +105,8 @@ static struct proc_dir_entry *proc_entry = NULL;
 // generic
 
 #define ID_IS_PFN_FLAG (1ULL << 63)
+
+#define ANCHOR_FILTER_BITS 16
 
 // ----------------- enums & structs -----------------
 
@@ -176,6 +185,8 @@ struct segment_pages {
 	u64 *pages;
 	unsigned int head;
 	unsigned int count;
+	u64 last_update_ns;
+	u64 last_load_ns;
 };
 
 struct load_segment {
@@ -248,6 +259,9 @@ static unsigned int process_interval_ms = 500;
 // events file
 static struct file *events_file;
 static loff_t events_file_pos;
+
+// generic
+static unsigned long *anchor_filter = NULL;
 
 // ----------------- utils -----------------
 
@@ -335,6 +349,12 @@ static inline u32 pair_hash_u64(u64 a, u64 b)
 	return (u32)h;
 }
 
+/* utils: calculate hashtable key hash with three values */
+static inline u32 triple_hash_u64(u64 a, u64 b, u64 c)
+{
+	return pair_hash_u64(b ^ (a * 0x9e3779b97f4a7c15ULL), c);
+}
+
 /* utils: map hashbucket -> lock index */
 static inline unsigned int lock_index_for_bucket(u32 bucket)
 {
@@ -358,7 +378,8 @@ static u64 calculate_percentil(int percentil, u64 elements)
 /* global: find task and load a segment if feature is active
  * only if feature 'SEGMENT_LOAD_LAZY' or 'SEGMENT_LOAD_INSTANT' is active
  * */
-static void prefetch_segment(struct segment_pages *segment, segment_lock *lock);
+static void prefetch_segment(struct segment_pages *segment, segment_lock *lock,
+			     bool instant);
 
 /*
  * global: get segemnt by current->tgid and fault page and load
@@ -379,6 +400,9 @@ static void mark_segment_as(struct segment_pages *segment, bool loaded)
 {
 	if (is_not_active(SEGMENT_LOAD_LAZY | SEGMENT_LOAD_INSTANT))
 		return;
+
+	if (loaded)
+		segment->last_load_ns = ktime_get_ns();
 
 	if (segment->loaded == loaded)
 		return;
@@ -453,6 +477,55 @@ static void free_load_requests(void)
 		deallocation(req);
 		node = next;
 	}
+}
+
+// anchor filter
+
+/* anchor filter: bit index of (tgid, page) */
+static inline unsigned int anchor_filter_index(pid_t tgid, u64 id)
+{
+	return pair_hash_u64(tgid, id) >> (32 - ANCHOR_FILTER_BITS);
+}
+
+/* anchor filter: mark (tgid, page) as ancher of a segment */
+static void anchor_filter_set(pid_t tgid, u64 id)
+{
+	if (anchor_filter)
+		set_bit(anchor_filter_index(tgid, id), anchor_filter);
+}
+
+/* anchor filter: hot path test (no lock, no allocation) */
+static inline bool anchor_filter_test(pid_t tgid, u64 id)
+{
+	unsigned long *filter = READ_ONCE(anchor_filter);
+
+	if (!filter)
+		return true;
+
+	return test_bit(anchor_filter_index(tgid, id), filter);
+}
+
+/* anchor filter: allocate (non fatal) */
+static void alloc_anchor_filter(void)
+{
+	anchor_filter = aallocation(BITS_TO_LONGS(1UL << ANCHOR_FILTER_BITS),
+				    sizeof(unsigned long));
+	if (!anchor_filter) {
+		pr_warn("%s: could not allocate anchor filter, loading every event\n",
+			MODULE_NAME);
+		return;
+	}
+
+	bitmap_zero(anchor_filter, 1UL << ANCHOR_FILTER_BITS);
+}
+
+/* anchor filter: free */
+static void free_anchor_filter(void)
+{
+	unsigned long *filter = anchor_filter;
+
+	WRITE_ONCE(anchor_filter, NULL);
+	deallocation(filter);
 }
 
 // ----------------- heap tree -----------------
@@ -620,7 +693,7 @@ static void free_bucket_locks(void)
 static void pair_table_inc(pid_t pid, pid_t tgid, u64 a, u64 b)
 {
 	struct pair_entry *entry;
-	u32 h32 = pair_hash_u64(tgid, a);
+	u32 h32 = triple_hash_u64(tgid, a, b);
 	u32 bucket = hash_min(h32, HASH_BITS(pair_table));
 	unsigned int li = lock_index_for_bucket(bucket);
 
@@ -750,10 +823,23 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 	spin_lock(&segments_locks[li]);
 	hash_for_each_possible(segments_table, entry, node, h32) {
 		if (entry->tgid == tgid && entry->id == id) {
-			entry->pages[entry->head] = page;
-			entry->head = (entry->head + 1) % max_segment_size;
-			if (entry->count < max_segment_size)
-				entry->count++;
+			unsigned int k;
+			bool know = false;
+
+			for (k = 0; k < entry->count; k++) {
+				know = entry->pages[k] == page;
+				if (know)
+					break;
+			}
+
+			if (!know) {
+				entry->pages[entry->head] = page;
+				entry->head =
+					(entry->head + 1) % max_segment_size;
+				if (entry->count < max_segment_size)
+					entry->count++;
+			}
+			entry->last_update_ns = ktime_get_ns();
 
 			spin_unlock(&segments_locks[li]);
 			return;
@@ -767,7 +853,7 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 		return;
 	}
 
-	entry->pages = (u64 *)aallocation(max_segment_size, sizeof(u64));
+	entry->pages = (u64 *)allocation(max_segment_size * sizeof(u64));
 	if (!entry->pages) {
 		deallocation(entry);
 		spin_unlock(&segments_locks[li]);
@@ -781,9 +867,12 @@ static void segments_table_inc(pid_t pid, pid_t tgid, u64 id, u64 page)
 	entry->head = 1;
 	entry->count = 1;
 	entry->loaded = false;
+	entry->last_update_ns = ktime_get_ns();
+	entry->last_load_ns = 0;
 	atomic64_inc(&stat_segments);
 
 	hash_add(segments_table, &entry->node, h32);
+	anchor_filter_set(tgid, id);
 
 	spin_unlock(&segments_locks[li]);
 }
@@ -818,12 +907,12 @@ static void push_event_to_percpu(u64 id, enum event_type type)
 		}
 	}
 
-	if (is_active(SEGMENT_LOAD_INSTANT)) {
+	if (is_active(SEGMENT_LOAD_INSTANT) && anchor_filter_test(tgid, id)) {
 		push_load_request(tgid, id);
 	}
 
 	// simple sampling based on total events (not perfect but ok)
-	if ((atomic64_read(&stat_events) % sample_rate) != 0) {
+	if ((atomic64_read(&stat_events) % max(sample_rate, 2u)) != 0) {
 		atomic64_inc(&stat_dropped);
 		atomic64_inc(&stat_events);
 
@@ -872,18 +961,18 @@ static unsigned int snapshot_percpu_buffer(int cpu, struct page_event *out_buf,
 	// oldest idx:
 	idx = (rb->head - rb->count + buf_len) % buf_len;
 	for (i = 0; i < cmax; ++i) {
-		idx = (idx + 1) % buf_len;
 		struct page_event p = rb->buf[idx];
-
-		if (!p.pid || !p.id)
-			continue;
-
-		out_buf[cnt++] = p;
 
 		// invalidate event
 		rb->buf[idx].pid = 0;
 		rb->buf[idx].id = 0;
 		rb->count--;
+		idx = (idx + 1) % buf_len;
+
+		if (!p.pid || !p.id)
+			continue;
+
+		out_buf[cnt++] = p;
 	}
 
 	spin_unlock_irqrestore(&rb->lock, flags);
@@ -1016,7 +1105,8 @@ static void process_events_fn(struct work_struct *work)
 /* global-implementation: find task and load a segment if feature is active
  * only if feature 'SEGMENT_LOAD_LAZY' or 'SEGMENT_LOAD_INSTANT' is active
  * */
-static void prefetch_segment(struct segment_pages *segment, segment_lock *lock)
+static void prefetch_segment(struct segment_pages *segment, segment_lock *lock,
+			     bool instant)
 {
 	if (is_not_active(SEGMENT_LOAD_LAZY | SEGMENT_LOAD_INSTANT))
 		return;
@@ -1030,7 +1120,17 @@ static void prefetch_segment(struct segment_pages *segment, segment_lock *lock)
 	u8 value;
 
 	spin_lock(lock);
-	if (segment->loaded) {
+	if (instant && instant_cooldown_ms) {
+		u64 now = ktime_get_ns();
+		u64 last = segment->last_load_ns;
+
+		if (last &&
+		    (now < last ||
+		     now - last < instant_cooldown_ms * NSEC_PER_MSEC)) {
+			spin_unlock(lock);
+			return;
+		}
+	} else if (segment->loaded) {
 		spin_unlock(lock);
 		return;
 	}
@@ -1058,7 +1158,7 @@ static void prefetch_segment(struct segment_pages *segment, segment_lock *lock)
 			continue;
 
 		out = access_process_vm(task, addr, &value, sizeof(value), 0);
-		if (out <= 0) {
+		if (out == 0) {
 			pr_debug(
 				"%s: prefetch failed pid=%d tgid=%d addr=%llx\n",
 				MODULE_NAME, segment->pid, segment->tgid, addr);
@@ -1088,7 +1188,7 @@ static void prefetch_segment_by_id(pid_t tgid, u64 id)
 
 	hash_for_each_possible(segments_table, entry, node, h32) {
 		if (entry->tgid == tgid && entry->id == id) {
-			prefetch_segment(entry, &segments_locks[li]);
+			prefetch_segment(entry, &segments_locks[li], true);
 			break;
 		}
 	}
@@ -1108,7 +1208,7 @@ static void prefetch_segments(void)
 
 	hash_for_each(segments_table, bucket, entry, node) {
 		unsigned int li = lock_index_for_bucket(bucket);
-		prefetch_segment(entry, &segments_locks[li]);
+		prefetch_segment(entry, &segments_locks[li], false);
 	}
 }
 
@@ -1231,9 +1331,18 @@ static int kp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	if (READ_ONCE(cur_state) != WINDOW_ON)
 		return 0;
 
+	if (current->flags & (PF_KTHREAD | PF_EXITING))
+		return 0;
+
+	if (unlikely(!pcpu_bufs))
+		return 0;
+
 	u64 id = 0;
 	char type = '-';
 	if (p == &kp_folio_mark) {
+		if (is_not_active(EVENTS_FILE))
+			return 0;
+
 		atomic64_inc(&folio_mark_hits);
 		type = ACCESSED;
 
@@ -1375,6 +1484,14 @@ static void verify_params(void)
 
 		pr_warn("%s: 'buf_len' value is invalid, setupping buf_len=%d\n",
 			MODULE_NAME, buf_len);
+	}
+
+	if (instant_cooldown_ms < 0 || instant_cooldown_ms > 60000) {
+		instant_cooldown_ms = max(instant_cooldown_ms, 0);
+		instant_cooldown_ms = min(instant_cooldown_ms, 60000);
+
+		pr_warn("%s: 'instant_cooldown_ms' value is invalid, setupping instant_cooldown_ms=%lu\n",
+			MODULE_NAME, instant_cooldown_ms);
 	}
 
 	if (segments_percentil < 10 || segments_percentil > 99) {
@@ -1582,6 +1699,12 @@ static int handle_errors(int errors, int *returns)
 
 	unregister_my_kprobes();
 
+	free_load_requests();
+	free_pair_table();
+	free_processors_table();
+	free_segments_table();
+	free_anchor_filter();
+
 	for (int i = 0; i < 7; i++)
 		if (returns[i])
 			return returns[i];
@@ -1593,7 +1716,7 @@ static int handle_errors(int errors, int *returns)
 static int __init pw_init(void)
 {
 	int errors = 0;
-	int ret[7];
+	int ret[7] = { 0 };
 
 	verify_features();
 	verify_params();
@@ -1612,9 +1735,11 @@ static int __init pw_init(void)
 
 	ret[0] = alloc_dependencies(&errors);
 
+	alloc_anchor_filter();
+
 	ret[1] = start_workers(&errors);
 
-	if (open_events_file() > 0) {
+	if (open_events_file() != 0) {
 		pr_warn("%s: failed to open events file\n", MODULE_NAME);
 	}
 
@@ -1679,6 +1804,8 @@ static void __exit pw_exit(void)
 
 	// free per-cpu buffers
 	free_percpu_buffers();
+
+	free_anchor_filter();
 
 	// free locks
 	free_bucket_locks();
