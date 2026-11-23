@@ -1,5 +1,21 @@
-name=r2_w9000-1000,sample_rate=2,on_ms=9000,off_ms=1000,active=7
-name=r5_w9000-1000,sample_rate=5,on_ms=9000,off_ms=1000,active=7
-name=r10_w9000-1000,sample_rate=10,on_ms=9000,off_ms=1000,active=7
-name=r100_w9000-1000,sample_rate=100,on_ms=9000,off_ms=1000,active=7
-name=r500_w9000-1000,sample_rate=500,on_ms=9000,off_ms=1000,active=7
+# reference without the module
+name=normal
+
+# module collecting but never loading: measures only the overhead
+name=count_only,active=26,sample_rate=2,on_ms=1000,off_ms=500
+
+# the three load modes
+name=lazy,active=58,sample_rate=2,on_ms=1000,off_ms=500
+name=instant,active=90,sample_rate=2,on_ms=1000,off_ms=500
+name=lazy_instant,active=122,sample_rate=2,on_ms=1000,off_ms=500
+
+# sampling: cheaper collection vs. less information
+name=lazy_instant_s5,active=122,sample_rate=5,on_ms=1000,off_ms=500
+name=lazy_instant_s20,active=122,sample_rate=20,on_ms=1000,off_ms=500
+
+# INSTANT cooldown: 0 = old one-shot behavior, 200 = more aggressive reload
+name=instant_cd0,active=90,sample_rate=2,on_ms=1000,off_ms=500,instant_cooldown_ms=0
+name=instant_cd200,active=90,sample_rate=20,on_ms=1000,off_ms=500,instant_cooldown_ms=200
+
+# longer collection window
+name=instant_w4000,active=90,sample_rate=2,on_ms=4000,off_ms=1000

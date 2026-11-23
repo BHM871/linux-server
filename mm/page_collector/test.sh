@@ -74,19 +74,23 @@ function run_test() {
 		return
 	fi
 
-	sudo rm /tmp/page_window_rate_events.bin
+	if [[ "$data_name" != "normal" ]]; then
+		sudo rm /tmp/page_window_rate_events.bin
 
-	params=$(echo $params | sed 's/,/ /g')
-	echo "[...] Installing $MODULE with params: $params"
-	sudo insmod "$MODULE.ko" $params
+		params=$(echo $params | sed 's/,/ /g')
+		echo "[...] Installing $MODULE with params: $params"
+		sudo insmod "$MODULE.ko" $params
 
-	sleep 1
+		sleep 1
+	fi
 
-	echo "[...] Starting benchmarks at $(date '+%Hh %Mm %Ss %Nns')"
+	echo "[...] Starting benchmark '$data_name' at $(date '+%Hh %Mm %Ss %Nns')"
 	timer=$(run_bench "$PROCFILE")
 
-	echo "[...] Removing $MODULE"
-	sudo rmmod "$MODULE"
+	if [[ "$data_name" != "normal" ]]; then
+		echo "[...] Removing $MODULE"
+		sudo rmmod "$MODULE"
+	fi
 
 	echo "[...] Saving logs"
 	save_logs "$data_name" "$timer"
@@ -115,7 +119,7 @@ function main() {
 			TESTS=$(echo "$2" | sed "s/;/ /g")
 			;;
 		"-ft" | "--file-tests")
-			FILETESTS=$(cat "$2")
+			FILETESTS="$2"
 			;;
 		"-n" | "--notifier")
 			NOTIFIER="$2"
@@ -136,21 +140,20 @@ function main() {
 
 	mkdir -p "$DATADIR"
 
-	echo "[...] Starting normal test"
-
-	local timer=$(run_bench "none")
-	save_logs "normal" "$timer"
-
-	echo "[✓] Normal test finished"
-
 	echo "[...] Starting configured tests"
 
 	local ti=1
 	if [[ "$FILETESTS" != "" ]]; then
-		for params in $FILETESTS; do
-			run_test "$ti" "$params"
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			line="${line%%#*}"
+			line="$(echo "$line" | tr -d '[:space:]')"
+
+			[[ -z "$line" ]] && continue
+
+			run_test "$ti" "$line"
+
 			ti=$((ti + 1))
-		done
+		done <"$FILETESTS"
 	fi
 
 	if [[ "$TESTS" != "" ]]; then

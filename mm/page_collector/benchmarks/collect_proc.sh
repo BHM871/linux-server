@@ -1,8 +1,8 @@
 #! /usr/bin/bash
 
 OUT_DIR=""
-MEM_FILE="meminfo"
-VM_FILE="vminfo"
+MEM_FILE="meminfo.csv"
+VM_FILE="vminfo.csv"
 
 function collect_mem() {
 	local type="$1"
