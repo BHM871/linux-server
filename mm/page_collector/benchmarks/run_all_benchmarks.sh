@@ -9,7 +9,8 @@ elif [[ "$1" == "none" ]]; then
 	log=0
 fi
 
-PROCFILE="/proc/$1"
+PROCFILENAME="$1"
+PROCFILE="/proc/$PROCFILENAME"
 
 LOGDIR="./bench_logs"
 mkdir -p "$LOGDIR"
@@ -19,16 +20,10 @@ rm -f $LOGDIR/* 2>/dev/null
 
 if [[ $log -eq 1 ]]; then
 	echo "[+] Registring initial module..."
-	[[ -r "$PROCFILE" ]] && cat $PROCFILE | sort -n >"$LOGDIR/initial_proc_dump.csv"
+	[[ -r "$PROCFILE" ]] && cat $PROCFILE | sort -n >"$LOGDIR/$PROCFILENAME.proc_before"
 fi
 
 sync && echo 3>"/proc/sys/vm/drop_caches"
-
-start=$(date +%s%N)
-
-echo "[...] Running Workload..."
-./run_workload.sh &
-wpid="$!"
 
 echo "[...] Running stress-ng..."
 ./run_stress_bench.sh &
@@ -46,16 +41,12 @@ echo "[...] Running Nginx benchmark..."
 ./run_nginx_bench.sh &
 npid="$!"
 
-wait "$wpid" "$spid" "$mpid" "$ppid" "$npid"
-
-end=$(date +%s%N)
-duration=$((end - start))
+wait "$spid" "$mpid" "$ppid" "$npid"
 
 if [[ $log -eq 1 ]]; then
 	echo "[+] Capturing final logs..."
 
-	[[ -r "$PROCFILE" ]] && cat $PROCFILE >"$LOGDIR/final_proc_dump.csv"
-	echo "# timers start: $start end: $end duration: $duration" >>"$LOGDIR/final_proc_dump.csv"
+	[[ -r "$PROCFILE" ]] && cat $PROCFILE >"$LOGDIR/$PROCFILENAME.proc_after"
 fi
 
 echo "[✓] All benchmarks finished!"
@@ -63,5 +54,3 @@ echo "[✓] All benchmarks finished!"
 if [[ $log -eq 1 ]]; then
 	echo "Results storaged at $LOGDIR/"
 fi
-
-echo "[✓] start: $start end: $end duration: $duration"
