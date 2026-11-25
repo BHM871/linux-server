@@ -1,21 +1,35 @@
 #! /usr/bin/bash
 
+# Module infos
 MODULE=""
 PROCFILE=""
+
+# Tests infos
+WORKLOAD=0
 FILETESTS=""
-NOTIFIER=""
+DATAFILE="pattern_data.bin"
+SIZE_MB=512
+PATTERNS="chain stride random seq"
+GROUPS_N=64
+MEMBERS=8
+STEADY=10
+WARM_ROUNDS=5
+WARM_SECONDS=20
+THINK_US=500
+EVICT="dontneed"
+DROP_CACHES=0
+RANDOM_FLAG=""
+
+# Logs infos
 LOGDIR="./benchmarks/bench_logs/"
 DATADIR="datas_collected"
+
+# Notifier
+NOTIFIER=""
 
 function save_logs() {
 	local path="$1"
 	local timers="$2"
-
-	rm -rf "$DATADIR/$path"
-
-	for file in $(ls "$LOGDIR"); do
-		cp "$LOGDIR/$file" "$DATADIR/$path/"
-	done
 
 	if [[ "$path" != "normal" ]]; then
 		python ./events_converter.py
@@ -58,8 +72,8 @@ function collect_mm() {
 }
 
 function load_module() {
-	echo "[...] Installing $MODULE with params: $1"
-	insmod "$MODULE.ko" $1
+	echo "[...] Installing $MODULE with params: $@"
+	insmod "$MODULE.ko" $@
 }
 
 function unload_module() {
@@ -67,12 +81,47 @@ function unload_module() {
 	rmmod "$MODULE"
 }
 
-function run_bench() {
-	local path="$1"
-	local proc="$2"
+function run_patterns() {
+	local dir="$1"
 
-	rm -rf "$DATADIR/$path"
-	mkdir -p "$DATADIR/$path"
+	if [[ ! -x "pattern_workload" ]]; then
+		echo "[...] Compilling pattern_workload.c"
+		gcc -O2 -o pattern_workload pattern_workload.c || exit 1
+	fi
+
+	for pattern in $PATTERNS; do
+		echo "        Running $pattern"
+
+		[[ $DROP_CACHES -eq 1 ]] && sync && echo 3>"/proc/sys/vm/drop_caches"
+
+		local maj0 min0
+		maj0=$(vm_value pgmajfault)
+		min0=$(vm_value pgfault)
+
+		./pattern_workload -f "$dir/$DATAFILE" -s "$SIZE_MB" -p "$pattern" -g "$GROUPS_N" \
+			-m "$MEMBERS" -r "$STEADY" -w "$WARM_ROUNDS" -T "$WARM_SECONDS" \
+			-t "$THINK_US" -e "$EVICT" $RANDOM_FLAG >"$dir/$pattern.csv"
+
+		local maj1 min1
+		maj1=$(vm_value pgmajfault)
+		min1=$(vm_value pgfault)
+
+		{
+			echo "pgmajfault $((maj1 - maj0))"
+			echo "pgfault $((min1 - min0))"
+		} >"$dir/$pattern.vm"
+
+		sleep 2
+	done
+}
+
+function run_bench() {
+	local name="$1"
+
+	rm -rf "$DATADIR/$name"
+	mkdir -p "$DATADIR/$name"
+
+	[[ -f "/proc/$PROCFILE" ]] && cat "/proc/$PROCFILE" >"$DATADIR/$name/$name.proc_before"
 
 	local maj0 min0
 	maj0=$(vm_value pgmajfault)
@@ -80,17 +129,23 @@ function run_bench() {
 
 	local start=$(date +%s%N)
 
+	test_pid=0
 	cd "benchmarks"
+	if [[ "$WORKLOAD" -eq 0 ]]; then
+		[[ $DROP_CACHES -eq 1 ]] && sync && echo 3>"/proc/sys/vm/drop_caches"
 
-	sudo ./run_all_benchmarks.sh "$proc" >"../$DATADIR/$path/bench_logs.log" &
-	bench_pid=$!
-
+		sudo ./run_all_benchmarks.sh >"../$DATADIR/$name/bench_logs.log" &
+		test_pid=$!
+	else
+		run_patterns "../$DATADIR/$name" &
+		test_pid=$!
+	fi
 	cd ".."
 
-	collect_mm "$DATADIR/$path" &
+	collect_mm "$DATADIR/$name" &
 	collector_pid=$!
 
-	wait "$bench_pid"
+	wait "$test_pid"
 	kill -9 "$collector_pid"
 
 	local end=$(date +%s%N)
@@ -99,10 +154,12 @@ function run_bench() {
 	maj1=$(vm_value pgmajfault)
 	min1=$(vm_value pgfault)
 
+	[[ -f "/proc/$PROCFILE" ]] && cat "/proc/$PROCFILE" >"$DATADIR/$name/$name.proc_after"
+
 	{
 		echo "pgmajfault $((maj1 - maj0))"
 		echo "pgfault $((min1 - min0))"
-	} >"$DATADIR/$path/fault.vm"
+	} >"$DATADIR/$name/fault.vm"
 
 	echo "# timers start: $start end: $end duration: $((end - start))"
 }
@@ -111,7 +168,7 @@ function run_test() {
 	local execution="$1"
 	local params="$2"
 
-	sudo rm /tmp/page_window_rate_events.bin
+	[[ -f /tmp/page_window_rate_events.bin ]] && rm /tmp/page_window_rate_events.bin
 
 	data_name=$(echo "$params" | awk -F, '{ if ($1 ~ /^name=/) { sub(/^name=/, "", $1); print $1 } }')
 	params=$(echo $params | sed 's/,/ /g')
@@ -128,10 +185,11 @@ function run_test() {
 	fi
 
 	echo "[...] Starting benchmark '$data_name' at $(date '+%Hh %Mm %Ss %Nns')"
-	timer=$(run_bench "$data_name" "$PROCFILE"
-	run_bench "$data_name" "$PROCFILE"
+	run_bench "$data_name"
+	timer=""
+	# timer=$(run_bench "$data_name")
 
-	[[ -r "/proc/$PROCFILE" ]] && cat "/proc/$PROCFILE" >"$DATADIR/$data_name/final.proc"
+	[[ -f "/proc/$PROCFILE" ]] && cat "/proc/$PROCFILE" >"$DATADIR/$data_name/final.proc"
 
 	if [[ "$data_name" != "normal" ]]; then
 		unload_module
@@ -155,10 +213,37 @@ function shout() {
 function main() {
 	while [[ "$1" != "" ]]; do
 		case "$1" in
+		"-n" | "--notifier") NOTIFIER="$2" ;;
 		"-m" | "--module") MODULE="$2" ;;
 		"-f" | "--file") PROCFILE="$2" ;;
+		"-dd" | "--data-dir") DATADIR="$2" ;;
 		"-ft" | "--file-tests") FILETESTS="$2" ;;
-		"-n" | "--notifier") NOTIFIER="$2" ;;
+		"-F" | "--data-file") DATAFILE="$2" ;;
+		"-S" | "--size-mb") SIZE_MB="$2" ;;
+		"-p" | "--pattern") PATTERNS="$2" ;;
+		"-g" | "--group") GROUPS_N="$2" ;;
+		"-M" | "--members") MEMBERS="$2" ;;
+		"-r" | "--steady") STEADY="$2" ;;
+		"-W" | "--warm-rounds") WARM_ROUNDS="$2" ;;
+		"-T" | "--warm-seconds") WARM_SECONDS="$2" ;;
+		"-t" | "--think-us") THINK_US="$2" ;;
+		"-e" | "--evict") EVICT="$2" ;;
+		"-D" | "--drop")
+			DROP_CACHES=1
+			shift
+			continue
+			;;
+		"-R" | "--random-flag")
+			RANDOM_FLAG="-R"
+			shift
+			continue
+			;;
+		"-w" | "--workload")
+			WORKLOAD=1
+			shift
+			continue
+			;;
+		*) exit 1 ;;
 		esac
 
 		shift
@@ -207,6 +292,8 @@ function main() {
 	fi
 
 	echo "[✓] All tests finished"
+
+	[[ "$WORKLOAD" -eq 1 ]] && python ./collect_patterns_results.py --dir "$DATADIR"
 
 	sudo chown -R adrian "$DATADIR"
 
